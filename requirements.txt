@@ -1,0 +1,10 @@
+PySide6
+insightface
+onnxruntime
+scikit-learn
+numpy
+opencv-python
+imagehash
+scipy
+requests
+pillow

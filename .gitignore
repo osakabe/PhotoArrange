@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Project specific
+media_cache.db
+app_debug.log
+.thumbnails/
+geo/
+insightface/models/
+*.onnx
+
+# IDE
+.vscode/
+.idea/
+
+# Distribution
+dist/
+build/
+*.spec
