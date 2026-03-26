@@ -93,6 +93,13 @@ class PersonManagerDialog(QDialog):
             
             row_layout.addLayout(vbox)
 
+            # Ignore Button
+            btn_ignore = QPushButton("🙈 Ignore")
+            btn_ignore.setFixedWidth(70)
+            btn_ignore.setStyleSheet("background-color: #37474F; color: #ECEFF1;")
+            btn_ignore.clicked.connect(lambda checked=False, c=cid: self.ignore_person(c))
+            row_layout.addWidget(btn_ignore)
+
             # Save Button for this row
             btn_save = QPushButton("Save")
             btn_save.setFixedWidth(60)
@@ -105,5 +112,11 @@ class PersonManagerDialog(QDialog):
     def save_name(self, cid, new_name):
         if new_name:
             self.db.upsert_cluster(cid, new_name)
-            # We don't refresh the whole list to avoid focus loss, 
-            # but usually, Pyside updates are enough
+
+    def ignore_person(self, cid):
+        confirm = QMessageBox.question(self, "Ignore Person", 
+                                     "Are you sure you want to ignore this person? They will be hidden from the UI.",
+                                     QMessageBox.Yes | QMessageBox.No)
+        if confirm == QMessageBox.Yes:
+            self.db.upsert_cluster(cid, "", is_ignored=True)
+            self.refresh_list()

@@ -58,9 +58,16 @@ class Database:
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS clusters (
                     cluster_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    custom_name TEXT
+                    custom_name TEXT,
+                    is_ignored INTEGER DEFAULT 0
                 )
             ''')
+            
+            # Migration check
+            cursor.execute("PRAGMA table_info(clusters)")
+            cols = [row[1] for row in cursor.fetchall()]
+            if "is_ignored" not in cols:
+                cursor.execute("ALTER TABLE clusters ADD COLUMN is_ignored INTEGER DEFAULT 0")
             
             # Indexing for performance
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_media_hash ON media (image_hash)')
@@ -126,20 +133,37 @@ class Database:
                 all_groups.append(group)
             return all_groups
 
-    def get_clusters(self):
+    def get_clusters(self, include_ignored=False):
         with self.get_connection() as conn:
             cursor = conn.execute('SELECT DISTINCT cluster_id FROM faces')
             cids = [row[0] for row in cursor.fetchall()]
             results = []
             for cid in cids:
-                cursor = conn.execute('SELECT custom_name FROM clusters WHERE cluster_id = ?', (cid,))
+                query = 'SELECT custom_name, is_ignored FROM clusters WHERE cluster_id = ?'
+                cursor = conn.execute(query, (cid,))
                 row = cursor.fetchone()
-                results.append((cid, row[0] if row else None))
+                
+                name = row[0] if row else None
+                ignored = row[1] if row else 0
+                
+                if not include_ignored and ignored:
+                    continue
+                    
+                results.append((cid, name))
             return results
 
-    def upsert_cluster(self, cluster_id, name):
+    def upsert_cluster(self, cluster_id, name, is_ignored=None):
         with self.get_connection() as conn:
-            conn.execute('INSERT OR REPLACE INTO clusters (cluster_id, custom_name) VALUES (?, ?)', (cluster_id, name))
+            if is_ignored is not None:
+                conn.execute('''
+                    INSERT INTO clusters (cluster_id, custom_name, is_ignored) VALUES (?, ?, ?)
+                    ON CONFLICT(cluster_id) DO UPDATE SET custom_name=excluded.custom_name, is_ignored=excluded.is_ignored
+                ''', (cluster_id, name, is_ignored))
+            else:
+                conn.execute('''
+                    INSERT INTO clusters (cluster_id, custom_name) VALUES (?, ?)
+                    ON CONFLICT(cluster_id) DO UPDATE SET custom_name=excluded.custom_name
+                ''', (cluster_id, name))
 
     def get_cluster_representative_data(self, cluster_id):
         with self.get_connection() as conn:
