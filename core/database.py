@@ -61,6 +61,12 @@ class Database:
                     custom_name TEXT
                 )
             ''')
+            
+            # Indexing for performance
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_media_hash ON media (image_hash)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_media_modified ON media (last_modified)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_faces_filepath ON faces (file_path)')
+            
             conn.commit()
 
     def get_media(self, file_path):
@@ -143,23 +149,43 @@ class Database:
 
     def get_duplicate_groups(self):
         with self.get_connection() as conn:
-            cursor = conn.execute('''
-                SELECT image_hash FROM media 
-                WHERE image_hash IS NOT NULL 
-                GROUP BY image_hash HAVING COUNT(*) > 1
-            ''')
-            hashes = [row[0] for row in cursor.fetchall()]
+            # Optimized single query to fetch all files that have a duplicate hash
+            query = '''
+                SELECT file_path, metadata_json, image_hash 
+                FROM media 
+                WHERE image_hash IN (
+                    SELECT image_hash FROM media 
+                    WHERE image_hash IS NOT NULL 
+                    GROUP BY image_hash HAVING COUNT(*) > 1
+                )
+                ORDER BY image_hash
+            '''
+            cursor = conn.execute(query)
+            rows = cursor.fetchall()
+            
             all_groups = []
-            for h in hashes:
-                cursor = conn.execute('SELECT file_path, metadata_json FROM media WHERE image_hash = ?', (h,))
-                group = []
-                for row in cursor.fetchall():
-                    group.append({
-                        "file_path": row[0],
-                        "metadata": json.loads(row[1]) if row[1] else {},
-                        "group_hash": h
-                    })
-                all_groups.append(group)
+            current_hash = None
+            current_group = []
+            
+            for row in rows:
+                path, meta, h = row
+                item = {
+                    "file_path": path,
+                    "metadata": json.loads(meta) if meta else {},
+                    "group_hash": h
+                }
+                
+                if h != current_hash:
+                    if current_group:
+                        all_groups.append(current_group)
+                    current_group = [item]
+                    current_hash = h
+                else:
+                    current_group.append(item)
+            
+            if current_group:
+                all_groups.append(current_group)
+                
             return all_groups
 
     def clear_all_data(self):

@@ -393,7 +393,17 @@ class MainWindow(QMainWindow):
             self.btn_load_more.setVisible(len(media) == self.page_size)
     
     def cleanup_duplicates(self):
-        groups = self.db.get_duplicate_groups()
+        # UI Feedback for search phase
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self.status_label.setText("Searching for duplicates...")
+        QApplication.processEvents()
+        
+        try:
+            groups = self.db.get_duplicate_groups()
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.status_label.setText("")
+
         if not groups:
             QMessageBox.information(self, "Cleanup", "No duplicate groups found.")
             return
@@ -404,8 +414,12 @@ class MainWindow(QMainWindow):
                                      QMessageBox.Yes | QMessageBox.No)
         if confirm != QMessageBox.Yes: return
 
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setMaximum(len(groups))
+        self.progress_bar.setValue(0)
+        
         count = 0
-        for group in groups:
+        for i, group in enumerate(groups):
             # Sort by size descending
             group.sort(key=lambda x: x["metadata"].get("size", 0), reverse=True)
             
@@ -427,7 +441,11 @@ class MainWindow(QMainWindow):
                     count += 1
                 except Exception as e:
                     logger.error(f"Failed to delete {norm_path}: {e}")
+            
+            self.progress_bar.setValue(i + 1)
+            if i % 10 == 0: QApplication.processEvents()
 
+        self.progress_bar.setVisible(False)
         QMessageBox.information(self, "Cleanup Done", f"Synchronized {count} files (Deleted/Removed missing entries).")
         self.initialize_tree() # Refresh categories
         self.show_images_paged()
