@@ -3,6 +3,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
 from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QPixmap, QIcon
 import os
+from PIL import Image
 from processor.image_processor import ImageProcessor
 
 class PersonManagerDialog(QDialog):
