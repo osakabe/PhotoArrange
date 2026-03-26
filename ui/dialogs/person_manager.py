@@ -11,6 +11,7 @@ class PersonManagerDialog(QDialog):
         super().__init__(parent)
         self.db = db
         self.img_proc = ImageProcessor()
+        self.size_cache = {} # Cache for orig_w, orig_h to speed up refreshes
         self.setWindowTitle("Manage People")
         self.setMinimumSize(500, 600)
         self.init_ui()
@@ -69,9 +70,13 @@ class PersonManagerDialog(QDialog):
                         # Since thumbnails are created as img.thumbnail((256, 256))
                         # The aspect ratio is preserved.
                         try:
-                            # Use PIL to get original size without loading full data
-                            with Image.open(file_path) as orig:
-                                orig_w, orig_h = orig.size
+                            # Use PIL to get original size with caching to avoid repeated I/O
+                            if file_path in self.size_cache:
+                                orig_w, orig_h = self.size_cache[file_path]
+                            else:
+                                with Image.open(file_path) as orig:
+                                    orig_w, orig_h = orig.size
+                                self.size_cache[file_path] = (orig_w, orig_h)
                             
                             # Calculate the scale factor used to make the thumbnail
                             scale = min(256 / orig_w, 256 / orig_h)
@@ -121,6 +126,7 @@ class PersonManagerDialog(QDialog):
             btn_save.clicked.connect(lambda checked=False, c=cid, i=name_input: self.save_name(c, i.text()))
             row_layout.addWidget(btn_save)
             
+            row.cid = cid # Store ID to find it later
             self.list_layout.addWidget(row)
 
     def save_name(self, cid, new_name):
@@ -133,4 +139,11 @@ class PersonManagerDialog(QDialog):
                                      QMessageBox.Yes | QMessageBox.No)
         if confirm == QMessageBox.Yes:
             self.db.upsert_cluster(cid, "", is_ignored=True)
-            self.refresh_list()
+            # Efficiently remove only the affected row from UI
+            for i in range(self.list_layout.count()):
+                item = self.list_layout.itemAt(i)
+                if item and item.widget():
+                    widget = item.widget()
+                    if hasattr(widget, "cid") and widget.cid == cid:
+                        widget.deleteLater()
+                        break
