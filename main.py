@@ -169,6 +169,38 @@ class AnalysisWorker(QThread):
             logger.exception("Worker Error:")
             self.finished_all.emit(False, str(e))
 
+class CleanupWorker(QThread):
+    progress_val = Signal(int)
+    finished = Signal(int)
+
+    def __init__(self, groups, db):
+        super().__init__()
+        self.groups = groups
+        self.db = db
+
+    def run(self):
+        count = 0
+        for i, group in enumerate(self.groups):
+            # Sort by size descending
+            group.sort(key=lambda x: x["metadata"].get("size", 0), reverse=True)
+            
+            # Keep the first (largest), delete others
+            to_delete = group[1:]
+            for item in to_delete:
+                path = item["file_path"]
+                norm_path = os.path.abspath(os.path.normpath(path))
+                try:
+                    if os.path.exists(norm_path):
+                        send2trash.send2trash(norm_path)
+                    self.db.delete_media(path)
+                    count += 1
+                except Exception as e:
+                    logger.error(f"Failed to delete {norm_path}: {e}")
+            
+            self.progress_val.emit(i + 1)
+        
+        self.finished.emit(count)
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -424,33 +456,12 @@ class MainWindow(QMainWindow):
         self.progress_bar.setMaximum(len(groups))
         self.progress_bar.setValue(0)
         
-        count = 0
-        for i, group in enumerate(groups):
-            # Sort by size descending
-            group.sort(key=lambda x: x["metadata"].get("size", 0), reverse=True)
-            
-            # Keep the first (largest), delete others
-            to_delete = group[1:]
-            for item in to_delete:
-                path = item["file_path"]
-                # Normalize path for Windows compatibility (avoids Errno 3)
-                norm_path = os.path.abspath(os.path.normpath(path))
-                
-                try:
-                    if os.path.exists(norm_path):
-                        send2trash.send2trash(norm_path)
-                    else:
-                        logger.warning(f"File already missing from disk: {norm_path}. Removing DB entry.")
-                        
-                    # Always remove from DB so the UI/view stays clean
-                    self.db.delete_media(path)
-                    count += 1
-                except Exception as e:
-                    logger.error(f"Failed to delete {norm_path}: {e}")
-            
-            self.progress_bar.setValue(i + 1)
-            if i % 10 == 0: QApplication.processEvents()
+        self.cleanup_worker = CleanupWorker(groups, self.db)
+        self.cleanup_worker.progress_val.connect(self.progress_bar.setValue)
+        self.cleanup_worker.finished.connect(self.on_cleanup_finished)
+        self.cleanup_worker.start()
 
+    def on_cleanup_finished(self, count):
         self.progress_bar.setVisible(False)
         QMessageBox.information(self, "Cleanup Done", f"Synchronized {count} files (Deleted/Removed missing entries).")
         self.initialize_tree() # Refresh categories

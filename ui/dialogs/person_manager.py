@@ -58,27 +58,40 @@ class PersonManagerDialog(QDialog):
             
             file_path, bbox = self.db.get_cluster_representative_data(cid)
             if file_path:
-                # We need the original image or at least a reasonably high-res thumbnail to crop
-                # For simplicity, we load the original if it exists
-                if os.path.exists(file_path):
+                thumb_path = self.img_proc.get_thumbnail_path(file_path)
+                if os.path.exists(thumb_path):
                     from PySide6.QtCore import QRect
-                    pix = QPixmap(file_path)
+                    # Load the thumbnail (which is 256px) for fast cropping
+                    pix = QPixmap(thumb_path)
                     if not pix.isNull() and bbox:
-                        # bbox format: [x1, y1, x2, y2]
-                        x1, y1, x2, y2 = bbox
-                        # Add some padding around the face (20%)
-                        w = x2 - x1
-                        h = y2 - y1
-                        x1 = max(0, x1 - w * 0.1)
-                        y1 = max(0, y1 - h * 0.1)
-                        w *= 1.2
-                        h *= 1.2
-                        
-                        crop_rect = QRect(int(x1), int(y1), int(w), int(h))
-                        face_pix = pix.copy(crop_rect)
-                        thumb.setPixmap(face_pix.scaled(80, 80, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+                        # We need to know the original image size to scale the bbox
+                        # Since thumbnails are created as img.thumbnail((256, 256))
+                        # The aspect ratio is preserved.
+                        try:
+                            # Use PIL to get original size without loading full data
+                            with Image.open(file_path) as orig:
+                                orig_w, orig_h = orig.size
+                            
+                            # Calculate the scale factor used to make the thumbnail
+                            scale = min(256 / orig_w, 256 / orig_h)
+                            
+                            x1, y1, x2, y2 = bbox
+                            # Scale box to thumbnail coords
+                            nx1, ny1 = x1 * scale, y1 * scale
+                            nw, nh = (x2 - x1) * scale, (y2 - y1) * scale
+                            
+                            # Padding
+                            nx1 = max(0, nx1 - nw * 0.1)
+                            ny1 = max(0, ny1 - nh * 0.1)
+                            nw *= 1.2
+                            nh *= 1.2
+                            
+                            crop_rect = QRect(int(nx1), int(ny1), int(nw), int(nh))
+                            face_pix = pix.copy(crop_rect)
+                            thumb.setPixmap(face_pix.scaled(80, 80, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+                        except Exception as e:
+                            thumb.setPixmap(pix.scaled(80, 80, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
                     elif not pix.isNull():
-                        # Fallback to center crop if no bbox
                         thumb.setPixmap(pix.scaled(80, 80, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
             
             row_layout.addWidget(thumb)
