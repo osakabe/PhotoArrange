@@ -141,11 +141,13 @@ class Database:
         with self.get_connection() as conn:
             conn.execute('INSERT OR REPLACE INTO clusters (cluster_id, custom_name) VALUES (?, ?)', (cluster_id, name))
 
-    def get_cluster_representative_path(self, cluster_id):
+    def get_cluster_representative_data(self, cluster_id):
         with self.get_connection() as conn:
-            cursor = conn.execute('SELECT file_path FROM faces WHERE cluster_id = ? LIMIT 1', (cluster_id,))
+            cursor = conn.execute('SELECT file_path, bbox_json FROM faces WHERE cluster_id = ? LIMIT 1', (cluster_id,))
             row = cursor.fetchone()
-            return row[0] if row else None
+            if row:
+                return row[0], json.loads(row[1]) if row[1] else None
+            return None, None
 
     def delete_media(self, file_path):
         with self.get_connection() as conn:

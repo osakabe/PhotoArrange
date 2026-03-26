@@ -53,14 +53,33 @@ class PersonManagerDialog(QDialog):
             # Thumbnail
             thumb = QLabel()
             thumb.setFixedSize(80, 80)
-            thumb.setStyleSheet("background-color: #0F111A; border-radius: 4px;")
+            thumb.setStyleSheet("background-color: #0F111A; border-radius: 40px; border: 2px solid #5C6BC0;")
+            thumb.setAlignment(Qt.AlignCenter)
             
-            file_path = self.db.get_cluster_representative_path(cid)
+            file_path, bbox = self.db.get_cluster_representative_data(cid)
             if file_path:
-                thumb_path = self.img_proc.get_thumbnail_path(file_path)
-                if os.path.exists(thumb_path):
-                    pix = QPixmap(thumb_path).scaled(80, 80, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
-                    thumb.setPixmap(pix)
+                # We need the original image or at least a reasonably high-res thumbnail to crop
+                # For simplicity, we load the original if it exists
+                if os.path.exists(file_path):
+                    from PySide6.QtCore import QRect
+                    pix = QPixmap(file_path)
+                    if not pix.isNull() and bbox:
+                        # bbox format: [x1, y1, x2, y2]
+                        x1, y1, x2, y2 = bbox
+                        # Add some padding around the face (20%)
+                        w = x2 - x1
+                        h = y2 - y1
+                        x1 = max(0, x1 - w * 0.1)
+                        y1 = max(0, y1 - h * 0.1)
+                        w *= 1.2
+                        h *= 1.2
+                        
+                        crop_rect = QRect(int(x1), int(y1), int(w), int(h))
+                        face_pix = pix.copy(crop_rect)
+                        thumb.setPixmap(face_pix.scaled(80, 80, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+                    elif not pix.isNull():
+                        # Fallback to center crop if no bbox
+                        thumb.setPixmap(pix.scaled(80, 80, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
             
             row_layout.addWidget(thumb)
 
