@@ -330,6 +330,13 @@ class MainWindow(QMainWindow):
     def show_images_paged(self):
         self.current_offset = 0
         self.grid_view.clear()
+        
+        # Reset pagination button state
+        self.btn_load_more.setVisible(True)
+        self.btn_load_more.setEnabled(True)
+        self.btn_load_more.setText("Load More...")
+        self.is_loading_more = False
+        
         self.load_next_page()
 
     def load_next_page(self):
