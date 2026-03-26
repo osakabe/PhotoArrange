@@ -65,7 +65,7 @@ class ThumbnailDelegate(QStyledItemDelegate):
             painter.drawText(rect, Qt.AlignVCenter | Qt.AlignLeft, hash_text)
             
             # Draw a line
-            line_y = rect.centerY()
+            line_y = rect.center().y()
             text_width = painter.fontMetrics().horizontalAdvance(hash_text)
             painter.setPen(QPen(self.border_color, 1))
             painter.drawLine(rect.left() + text_width + 10, line_y, rect.right() - 10, line_y)
