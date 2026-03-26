@@ -413,15 +413,22 @@ class MainWindow(QMainWindow):
             to_delete = group[1:]
             for item in to_delete:
                 path = item["file_path"]
+                # Normalize path for Windows compatibility (avoids Errno 3)
+                norm_path = os.path.abspath(os.path.normpath(path))
+                
                 try:
-                    if os.path.exists(path):
-                        send2trash.send2trash(path)
+                    if os.path.exists(norm_path):
+                        send2trash.send2trash(norm_path)
+                    else:
+                        logger.warning(f"File already missing from disk: {norm_path}. Removing DB entry.")
+                        
+                    # Always remove from DB so the UI/view stays clean
                     self.db.delete_media(path)
                     count += 1
                 except Exception as e:
-                    logger.error(f"Failed to delete {path}: {e}")
+                    logger.error(f"Failed to delete {norm_path}: {e}")
 
-        QMessageBox.information(self, "Cleanup Done", f"Moved {count} files to Recycle Bin.")
+        QMessageBox.information(self, "Cleanup Done", f"Synchronized {count} files (Deleted/Removed missing entries).")
         self.initialize_tree() # Refresh categories
         self.show_images_paged()
         
