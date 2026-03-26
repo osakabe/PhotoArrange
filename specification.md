@@ -51,9 +51,16 @@ All heavy I/O and AI processing (scanning, hashing, inference, clustering) is ha
   - Thumbnails are rendered using a `QStyledItemDelegate` for high performance.
   - Pagination: Loads 50 items per "page". Automatically requests the next batch when the vertical scroll bar reaches 90% of its maximum.
 
-### 3.3 Duplicate Detection
-- Uses `ImageHash` (Perceptual Hashing) to identify visually similar images regardless of resolution.
-- Grouped in the database via `image_hash`.
+### 3.3 Duplicate & Similarity Management
+- **Detection**: Uses `ImageHash.phash` (Perceptual Hashing) to identify visually similar images across different resolutions and compression levels.
+- **Grouping**:
+  - Media with matching hashes are assigned to the "Duplicates" category.
+  - The UI (ThumbnailGrid) inserts visual "Duplicate Group" headers between different hash groups.
+  - **Sorting**: Within the Duplicates view, items are sorted by `image_hash` and then by `size` descending.
+- **Smart Cleanup**:
+  - A "Cleanup Duplicates" button provides automated organization.
+  - **Policy**: The largest file (assumed highest quality) in each group is preserved. All other duplicates are safely moved to the OS **Recycle Bin** using `send2trash`.
+  - Database consistency is maintained by purging records of deleted files.
 
 ### 3.4 Reverse Geocoding
 - Uses `cities1000.txt` from GeoNames (167k+ cities).

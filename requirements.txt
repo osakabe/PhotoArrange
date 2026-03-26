@@ -8,3 +8,4 @@ imagehash
 scipy
 requests
 pillow
+send2trash

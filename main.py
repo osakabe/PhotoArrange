@@ -16,10 +16,10 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import sqlite3
 import numpy as np
-import json
 import shutil
 import logging
 import time
+import send2trash
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QProgressBar, QFileDialog,
                              QSplitter, QLabel, QMessageBox, QFrame)
@@ -215,6 +215,13 @@ class MainWindow(QMainWindow):
         self.btn_analyze.setEnabled(False)
         self.btn_analyze.clicked.connect(self.run_analysis)
         header_layout.addWidget(self.btn_analyze)
+        
+        self.btn_cleanup = QPushButton("🧹 Cleanup Duplicates")
+        self.btn_cleanup.setObjectName("danger")
+        self.btn_cleanup.setFixedWidth(160)
+        self.btn_cleanup.setVisible(False)
+        self.btn_cleanup.clicked.connect(self.cleanup_duplicates)
+        header_layout.addWidget(self.btn_cleanup)
 
         btn_settings = QPushButton("⚙️")
         btn_settings.setFixedWidth(40)
@@ -317,6 +324,7 @@ class MainWindow(QMainWindow):
             cid, year, month = item.data(Qt.UserRole + 1)
         
         self.current_filter = {"cluster_id": cid, "year": year, "month": month}
+        self.btn_cleanup.setVisible(cid == -2)
         self.show_images_paged()
 
     def show_images_paged(self):
@@ -348,18 +356,66 @@ class MainWindow(QMainWindow):
             display_data = []
             from processor.image_processor import ImageProcessor
             img_proc = ImageProcessor()
+            
+            # Keep track of last hash for header insertion in Duplicates view
+            # Note: Accessing model internal data directly for state tracking
+            last_hash = self.grid_view.media_model._data[-1].get("group_hash") if self.grid_view.media_model._data else None
+            
             for m in media:
                 file_path = m["file_path"]
+                current_hash = m.get("group_hash")
+                
+                # Check for new group header in Duplicates view
+                if f["cluster_id"] == -2 and current_hash and current_hash != last_hash:
+                    display_data.append({
+                        "is_header": True,
+                        "group_hash": current_hash
+                    })
+                    last_hash = current_hash
+                
                 display_data.append({
                     "file_path": file_path,
                     "thumbnail_path": img_proc.get_thumbnail_path(file_path),
                     "metadata": m["metadata"],
-                    "group_hash": m.get("group_hash")
+                    "group_hash": current_hash
                 })
             
             self.grid_view.append_data(display_data)
             self.current_offset += len(media)
             self.btn_load_more.setVisible(len(media) == self.page_size)
+    
+    def cleanup_duplicates(self):
+        groups = self.db.get_duplicate_groups()
+        if not groups:
+            QMessageBox.information(self, "Cleanup", "No duplicate groups found.")
+            return
+            
+        confirm = QMessageBox.question(self, "Confirm Cleanup", 
+                                     f"Found {len(groups)} groups. Delete smaller versions of all duplicates?\n"
+                                     "(Files will be moved to Recycle Bin)",
+                                     QMessageBox.Yes | QMessageBox.No)
+        if confirm != QMessageBox.Yes: return
+
+        count = 0
+        for group in groups:
+            # Sort by size descending
+            group.sort(key=lambda x: x["metadata"].get("size", 0), reverse=True)
+            
+            # Keep the first (largest), delete others
+            to_delete = group[1:]
+            for item in to_delete:
+                path = item["file_path"]
+                try:
+                    if os.path.exists(path):
+                        send2trash.send2trash(path)
+                    self.db.delete_media(path)
+                    count += 1
+                except Exception as e:
+                    logger.error(f"Failed to delete {path}: {e}")
+
+        QMessageBox.information(self, "Cleanup Done", f"Moved {count} files to Recycle Bin.")
+        self.initialize_tree() # Refresh categories
+        self.show_images_paged()
         
         self.is_loading_more = False
         self.btn_load_more.setEnabled(True)

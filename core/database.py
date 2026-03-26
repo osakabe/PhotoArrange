@@ -135,6 +135,33 @@ class Database:
         with self.get_connection() as conn:
             conn.execute('INSERT OR REPLACE INTO clusters (cluster_id, custom_name) VALUES (?, ?)', (cluster_id, name))
 
+    def delete_media(self, file_path):
+        with self.get_connection() as conn:
+            conn.execute('DELETE FROM faces WHERE file_path = ?', (file_path,))
+            conn.execute('DELETE FROM media WHERE file_path = ?', (file_path,))
+            conn.commit()
+
+    def get_duplicate_groups(self):
+        with self.get_connection() as conn:
+            cursor = conn.execute('''
+                SELECT image_hash FROM media 
+                WHERE image_hash IS NOT NULL 
+                GROUP BY image_hash HAVING COUNT(*) > 1
+            ''')
+            hashes = [row[0] for row in cursor.fetchall()]
+            all_groups = []
+            for h in hashes:
+                cursor = conn.execute('SELECT file_path, metadata_json FROM media WHERE image_hash = ?', (h,))
+                group = []
+                for row in cursor.fetchall():
+                    group.append({
+                        "file_path": row[0],
+                        "metadata": json.loads(row[1]) if row[1] else {},
+                        "group_hash": h
+                    })
+                all_groups.append(group)
+            return all_groups
+
     def clear_all_data(self):
         with self.get_connection() as conn:
             conn.execute('DELETE FROM faces')
@@ -175,13 +202,14 @@ class Database:
             return sorted([row[0] for row in cursor.fetchall()], reverse=True)
 
     def get_media_paged(self, cluster_id, year, month, limit=50, offset=0):
-        query = "SELECT m.file_path, m.metadata_json FROM media m"
+        query = "SELECT m.file_path, m.metadata_json, m.image_hash FROM media m"
         params = []
         where_clauses = []
         if cluster_id is not None:
             if cluster_id == -1:
                 where_clauses.append("m.file_path NOT IN (SELECT file_path FROM faces)")
             elif cluster_id == -2:
+                # Group duplicates by sorting by image_hash
                 where_clauses.append("m.image_hash IN (SELECT image_hash FROM media GROUP BY image_hash HAVING COUNT(*) > 1)")
             else:
                 query += " JOIN faces f ON m.file_path = f.file_path"
@@ -195,8 +223,14 @@ class Database:
             params.append(month)
         if where_clauses:
             query += " WHERE " + " AND ".join(where_clauses)
-        query += " ORDER BY m.last_modified DESC LIMIT ? OFFSET ?"
+        
+        # Ensure we sort by hash for duplicates to make grouping easy in the UI
+        if cluster_id == -2:
+            query += " ORDER BY m.image_hash, m.last_modified DESC LIMIT ? OFFSET ?"
+        else:
+            query += " ORDER BY m.last_modified DESC LIMIT ? OFFSET ?"
+            
         params.extend([limit, offset])
         with self.get_connection() as conn:
             cursor = conn.execute(query, params)
-            return [{"file_path": row[0], "metadata": json.loads(row[1]) if row[1] else {}} for row in cursor.fetchall()]
+            return [{"file_path": row[0], "metadata": json.loads(row[1]) if row[1] else {}, "group_hash": row[2]} for row in cursor.fetchall()]

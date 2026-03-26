@@ -53,6 +53,25 @@ class ThumbnailDelegate(QStyledItemDelegate):
     def paint(self, painter, option, index):
         data = index.data(Qt.UserRole)
         if not data: return
+        
+        # Handle Header rendering
+        if data.get("is_header"):
+            painter.save()
+            painter.setRenderHint(QPainter.Antialiasing)
+            rect = option.rect
+            painter.setPen(QPen(self.text_color))
+            painter.setFont(QFont("Inter", 10, QFont.Bold))
+            hash_text = f"Duplicate Group: {data['group_hash'][:8].upper()}"
+            painter.drawText(rect, Qt.AlignVCenter | Qt.AlignLeft, hash_text)
+            
+            # Draw a line
+            line_y = rect.centerY()
+            text_width = painter.fontMetrics().horizontalAdvance(hash_text)
+            painter.setPen(QPen(self.border_color, 1))
+            painter.drawLine(rect.left() + text_width + 10, line_y, rect.right() - 10, line_y)
+            painter.restore()
+            return
+
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing)
         is_hovered = option.state & QStyle.State_MouseOver
@@ -110,6 +129,9 @@ class ThumbnailDelegate(QStyledItemDelegate):
         painter.restore()
 
     def sizeHint(self, option, index):
+        data = index.data(Qt.UserRole)
+        if data and data.get("is_header"):
+            return QSize(option.rect.width(), 40)
         return self.card_size + QSize(10, 10)
 
 class ThumbnailGrid(QListView):
