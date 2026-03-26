@@ -348,6 +348,7 @@ class MainWindow(QMainWindow):
         f = self.current_filter
         media = self.db.get_media_paged(f["cluster_id"], f["year"], f["month"], 
                                       limit=self.page_size, offset=self.current_offset)
+        print(f"[DEBUG] Selection: {f}, Fetched: {len(media)} items")
         
         if not media:
             self.btn_load_more.setVisible(False)

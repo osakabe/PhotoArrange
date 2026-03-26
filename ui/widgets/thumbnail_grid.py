@@ -144,7 +144,7 @@ class ThumbnailGrid(QListView):
         self.setResizeMode(QListView.Adjust)
         self.setMovement(QListView.Static)
         self.setSpacing(5)
-        self.setUniformItemSizes(True)
+        self.setUniformItemSizes(False)
         self.media_model = MediaModel()
         self.setModel(self.media_model)
         self.setItemDelegate(ThumbnailDelegate(self))
