@@ -141,6 +141,12 @@ class Database:
         with self.get_connection() as conn:
             conn.execute('INSERT OR REPLACE INTO clusters (cluster_id, custom_name) VALUES (?, ?)', (cluster_id, name))
 
+    def get_cluster_representative_path(self, cluster_id):
+        with self.get_connection() as conn:
+            cursor = conn.execute('SELECT file_path FROM faces WHERE cluster_id = ? LIMIT 1', (cluster_id,))
+            row = cursor.fetchone()
+            return row[0] if row else None
+
     def delete_media(self, file_path):
         with self.get_connection() as conn:
             conn.execute('DELETE FROM faces WHERE file_path = ?', (file_path,))

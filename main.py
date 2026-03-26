@@ -32,6 +32,7 @@ from ui.widgets.tree_view import MediaTreeView
 from ui.widgets.thumbnail_grid import ThumbnailGrid
 from ui.theme import get_style_sheet
 from ui.dialogs.settings_dialog import SettingsDialog
+from ui.dialogs.person_manager import PersonManagerDialog
 
 # Logger setup
 logging.basicConfig(
@@ -222,6 +223,11 @@ class MainWindow(QMainWindow):
         self.btn_cleanup.setVisible(False)
         self.btn_cleanup.clicked.connect(self.cleanup_duplicates)
         header_layout.addWidget(self.btn_cleanup)
+
+        self.btn_people = QPushButton("👥 People")
+        self.btn_people.setFixedWidth(100)
+        self.btn_people.clicked.connect(self.show_person_manager)
+        header_layout.addWidget(self.btn_people)
 
         btn_settings = QPushButton("⚙️")
         btn_settings.setFixedWidth(40)
@@ -501,6 +507,11 @@ class MainWindow(QMainWindow):
         dialog.settings_changed.connect(self.update_threshold)
         dialog.data_reset.connect(self.reset_all)
         dialog.exec()
+
+    def show_person_manager(self):
+        dialog = PersonManagerDialog(self.db, self)
+        if dialog.exec():
+            self.initialize_tree() # Refresh naming in the sidebar
 
     def update_threshold(self, val):
         self.threshold = val
