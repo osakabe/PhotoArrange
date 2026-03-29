@@ -3,14 +3,16 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
 from PySide6.QtCore import Qt, Signal
 
 class SettingsDialog(QDialog):
-    settings_changed = Signal(int) # Signal for threshold change
-    data_reset = Signal()          # Signal for data reset
+    settings_changed = Signal(int) # Face threshold
+    dup_threshold_changed = Signal(int) # Duplicate threshold
+    data_reset = Signal()
 
-    def __init__(self, current_threshold, parent=None):
+    def __init__(self, current_threshold, current_dup_threshold=6, parent=None):
         super().__init__(parent)
         self.setWindowTitle("⚙️ 設定")
-        self.setMinimumWidth(400)
+        self.setMinimumWidth(450)
         self.threshold = current_threshold
+        self.dup_threshold = current_dup_threshold
         self.init_ui()
 
     def init_ui(self):
@@ -23,32 +25,57 @@ class SettingsDialog(QDialog):
         title.setStyleSheet("font-size: 18px; font-weight: bold; color: #3D5AFE;")
         layout.addWidget(title)
 
-        # --- Threshold Section ---
-        thresh_frame = QFrame()
-        thresh_frame.setObjectName("section")
-        thresh_layout = QVBoxLayout(thresh_frame)
+        # --- Face Threshold Section ---
+        face_frame = QFrame()
+        face_frame.setObjectName("section")
+        face_layout = QVBoxLayout(face_frame)
         
-        thresh_header = QHBoxLayout()
-        thresh_label = QLabel("🎯 顔認識の類似度閾値:")
-        thresh_label.setStyleSheet("font-weight: bold;")
-        self.val_label = QLabel(str(self.threshold))
-        self.val_label.setStyleSheet("color: #3D5AFE; font-size: 16px; font-weight: bold;")
-        thresh_header.addWidget(thresh_label)
-        thresh_header.addStretch()
-        thresh_header.addWidget(self.val_label)
-        thresh_layout.addLayout(thresh_header)
+        face_header = QHBoxLayout()
+        face_label = QLabel("🎯 顔認識の類似度閾値:")
+        face_label.setStyleSheet("font-weight: bold;")
+        self.face_val_label = QLabel(str(self.threshold))
+        self.face_val_label.setStyleSheet("color: #3D5AFE; font-size: 16px; font-weight: bold;")
+        face_header.addWidget(face_label)
+        face_header.addStretch()
+        face_header.addWidget(self.face_val_label)
+        face_layout.addLayout(face_header)
 
-        self.slider = QSlider(Qt.Horizontal)
-        self.slider.setRange(0, 20)
-        self.slider.setValue(self.threshold)
-        self.slider.valueChanged.connect(self.on_slider_change)
-        thresh_layout.addWidget(self.slider)
+        self.face_slider = QSlider(Qt.Horizontal)
+        self.face_slider.setRange(0, 20)
+        self.face_slider.setValue(self.threshold)
+        self.face_slider.valueChanged.connect(self.on_face_slider_change)
+        face_layout.addWidget(self.face_slider)
 
-        thresh_desc = QLabel("※値が小さいほど厳密に一致する顔を探します。通常は5前後が推奨されます。")
-        thresh_desc.setStyleSheet("color: #8A8EA8; font-size: 11px;")
-        thresh_layout.addWidget(thresh_desc)
+        face_desc = QLabel("※小さいほど厳密。通常は5前後が推奨されます。")
+        face_desc.setStyleSheet("color: #8A8EA8; font-size: 11px;")
+        face_layout.addWidget(face_desc)
+        layout.addWidget(face_frame)
+
+        # --- Duplicate Threshold Section ---
+        dup_frame = QFrame()
+        dup_frame.setObjectName("section")
+        dup_layout = QVBoxLayout(dup_frame)
         
-        layout.addWidget(thresh_frame)
+        dup_header = QHBoxLayout()
+        dup_label = QLabel("👯 重複検知の感度 (AI):")
+        dup_label.setStyleSheet("font-weight: bold;")
+        self.dup_val_label = QLabel(f"{self.dup_threshold/10.0:.1f}")
+        self.dup_val_label.setStyleSheet("color: #3D5AFE; font-size: 16px; font-weight: bold;")
+        dup_header.addWidget(dup_label)
+        dup_header.addStretch()
+        dup_header.addWidget(self.dup_val_label)
+        dup_layout.addLayout(dup_header)
+
+        self.dup_slider = QSlider(Qt.Horizontal)
+        self.dup_slider.setRange(1, 15)
+        self.dup_slider.setValue(self.dup_threshold)
+        self.dup_slider.valueChanged.connect(self.on_dup_slider_change)
+        dup_layout.addWidget(self.dup_slider)
+
+        dup_desc = QLabel("※大きいほど「似ている」と判定されやすくなります。標準は0.6です。")
+        dup_desc.setStyleSheet("color: #8A8EA8; font-size: 11px;")
+        dup_layout.addWidget(dup_desc)
+        layout.addWidget(dup_frame)
 
         layout.addStretch()
 
@@ -68,10 +95,15 @@ class SettingsDialog(QDialog):
         btn_close.clicked.connect(self.accept)
         layout.addWidget(btn_close)
 
-    def on_slider_change(self, value):
+    def on_face_slider_change(self, value):
         self.threshold = value
-        self.val_label.setText(str(value))
+        self.face_val_label.setText(str(value))
         self.settings_changed.emit(value)
+
+    def on_dup_slider_change(self, value):
+        self.dup_threshold = value
+        self.dup_val_label.setText(f"{value/10.0:.1f}")
+        self.dup_threshold_changed.emit(value)
 
     def confirm_reset(self):
         reply = QMessageBox.warning(

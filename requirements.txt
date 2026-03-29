@@ -9,3 +9,6 @@ scipy
 requests
 pillow
 send2trash
+torch
+torchvision
+faiss-cpu

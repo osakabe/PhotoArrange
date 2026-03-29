@@ -7,15 +7,24 @@ venv/
 
 # Project specific
 media_cache.db
+photo_app.db
+test_media*.db
+test_verify.db
 app_debug.log
 .thumbnails/
 geo/
 insightface/models/
 *.onnx
+tmp/
+tmp_*.py
+*.txt
+python-debugger/
 
 # IDE
 .vscode/
 .idea/
+.gemini/
+.agent/
 
 # Distribution
 dist/

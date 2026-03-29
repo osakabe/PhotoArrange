@@ -11,20 +11,27 @@ def get_style_sheet():
         font-size: 13px;
     }
     
-    /* Header & Toolbar */
     #header {
         background-color: #1A1D2E;
         border-bottom: 1px solid #2D324A;
-        padding: 4px 15px;
-        min-height: 50px;
-        max-height: 60px;
+        padding: 2px 15px;
+        min-height: 40px;
+        max-height: 40px;
+    }
+
+    #sub_header {
+        background-color: #141724;
+        border-bottom: 1px solid #2D324A;
+        padding: 2px 15px;
+        min-height: 36px;
+        max-height: 36px;
     }
     
     QPushButton {
         background-color: #2D324A;
         border: 1px solid #3F4663;
         border-radius: 6px;
-        padding: 6px 12px;
+        padding: 4px 10px;
         color: #E2E4EB;
         font-weight: 600;
     }
@@ -34,8 +41,10 @@ def get_style_sheet():
         border-color: #565E81;
     }
     
-    QPushButton:pressed {
-        background-color: #24283D;
+    QPushButton:disabled {
+        background-color: #1A1D2E;
+        color: #4A4D62;
+        border-color: #2D324A;
     }
     
     QPushButton#primary {
@@ -49,9 +58,27 @@ def get_style_sheet():
     }
     
     QPushButton#danger {
+        background-color: transparent;
+        border: 1px solid #FF525266;
+        color: #FF8A80;
+    }
+
+    QPushButton#danger:hover {
         background-color: #FF5252;
-        border: none;
+        border-color: #FF5252;
         color: white;
+    }
+
+    QPushButton#flat {
+        background-color: transparent;
+        border: 1px solid transparent;
+        color: #A0A4B8;
+    }
+
+    QPushButton#flat:hover {
+        background-color: #2D324A;
+        border-color: #3F4663;
+        color: #E2E4EB;
     }
 
     /* Sidebar / TreeView */
@@ -142,7 +169,43 @@ def get_style_sheet():
         border-radius: 7px;
     }
 
+    /* Input & Checkbox */
+    QLineEdit {
+        background-color: #1A1D2E;
+        border: 1px solid #2D324A;
+        border-radius: 4px;
+        padding: 5px;
+        color: #E2E4EB;
+    }
+    
+    QLineEdit:focus {
+        border-color: #3D5AFE;
+    }
+
+    QCheckBox {
+        spacing: 8px;
+    }
+
+    QCheckBox::indicator {
+        width: 18px;
+        height: 18px;
+        background-color: #1A1D2E;
+        border: 2px solid #3F4663;
+        border-radius: 4px;
+    }
+
+    QCheckBox::indicator:hover {
+        border-color: #3D5AFE;
+    }
+
+    QCheckBox::indicator:checked {
+        background-color: #3D5AFE;
+        border-color: #3D5AFE;
+        /* Simple checkmark shape via background coloring + border-radius */
+    }
+
     /* Splitter */
+
     QSplitter::handle {
         background-color: #2D324A;
     }
