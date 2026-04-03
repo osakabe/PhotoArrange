@@ -1,7 +1,7 @@
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                              QLineEdit, QPushButton, QScrollArea, QWidget, QFrame, QMessageBox, QCheckBox, QProgressBar)
 from PySide6.QtCore import Qt, QSize, QThread, Signal, QRect
-from PySide6.QtGui import QPixmap, QIcon
+from PySide6.QtGui import QPixmap, QIcon, QImage
 import os
 from PIL import Image
 from processor.image_processor import ImageProcessor
@@ -17,7 +17,7 @@ class PersonLoadWorker(QThread):
 
     def run(self):
         clusters = self.db.get_clusters()
-        for cid, current_name in sorted(clusters, key=lambda x: x[0]):
+        for cid, current_name in sorted(clusters, key=lambda x: (x[0] if x[0] is not None else -1)):
             data = {
                 "cid": cid,
                 "name": current_name,
@@ -29,7 +29,7 @@ class PersonLoadWorker(QThread):
             if file_path and os.path.exists(file_path):
                 thumb_path = self.img_proc.get_thumbnail_path(file_path)
                 if os.path.exists(thumb_path):
-                    pix = QPixmap(thumb_path)
+                    pix = QImage(thumb_path)
                     if not pix.isNull() and bbox:
                         try:
                             orig_w = metadata.get("width")
@@ -57,11 +57,11 @@ class PersonLoadWorker(QThread):
                                 nw *= 1.2
                                 nh *= 1.2
                                 crop_rect = QRect(int(nx1), int(ny1), int(nw), int(nh))
-                                data["pixmap"] = pix.copy(crop_rect)
+                                data["qimage"] = pix.copy(crop_rect)
                         except:
-                            data["pixmap"] = pix
+                            data["qimage"] = pix
                     elif not pix.isNull():
-                        data["pixmap"] = pix
+                        data["qimage"] = pix
             
             self.person_loaded.emit(data)
         
@@ -73,6 +73,7 @@ class PersonManagerDialog(QDialog):
         self.db = db
         self.img_proc = ImageProcessor()
         self.check_boxes = {} # cid -> (checkbox, name)
+        self.worker = None
         self.setWindowTitle("Manage People")
         self.setMinimumSize(540, 600)
         self.init_ui()
@@ -104,6 +105,12 @@ class PersonManagerDialog(QDialog):
         batch_layout.addWidget(self.btn_deselect_all)
 
         batch_layout.addStretch()
+
+        self.btn_reset_all = QPushButton("Reset All People")
+        self.btn_reset_all.setStyleSheet("background-color: #D32F2F; color: white; font-weight: bold; padding: 5px;")
+        self.btn_reset_all.clicked.connect(self.on_reset_all)
+        batch_layout.addWidget(self.btn_reset_all)
+
         layout.addLayout(batch_layout)
 
 
@@ -131,16 +138,37 @@ class PersonManagerDialog(QDialog):
         layout.addWidget(btn_close, alignment=Qt.AlignRight)
 
     def start_loading(self):
+        # 既存のスレッドが実行中の場合は切断してクリーンアップ
+        if self.worker and self.worker.isRunning():
+            self.worker.disconnect() # 古いシグナルがUIを壊さないようにする
+            self.worker.quit()
+            if not self.worker.wait(500): # 待機時間を500msに拡大
+                self.worker.terminate() # それでも終了しない場合は強制終了
+                self.worker.wait()
+
         self.check_boxes = {}
         self.worker = PersonLoadWorker(self.db, self.img_proc)
         self.worker.person_loaded.connect(self.add_person_row)
         self.worker.finished.connect(self.on_loading_finished)
         self.worker.start()
 
+    def closeEvent(self, event):
+        """ダイアログが閉じられる際にスレッドを安全に停止・クリーンアップする"""
+        if self.worker and self.worker.isRunning():
+            self.worker.disconnect() # シグナル受信を停止
+            self.worker.quit()
+            self.worker.wait(500) # 終了を待つ
+            if self.worker.isRunning():
+                self.worker.terminate()
+                self.worker.wait()
+        super().closeEvent(event)
+
     def add_person_row(self, data):
         cid = data["cid"]
         current_name = data["name"]
-        pix = data["pixmap"]
+        pix = data.get("qimage")
+        if pix:
+            pix = QPixmap.fromImage(pix)
 
         row = QFrame()
         row.setObjectName("card")
@@ -213,6 +241,21 @@ class PersonManagerDialog(QDialog):
                 self.check_boxes[cid] = (cb, new_name.strip())
 
 
+    def on_reset_all(self):
+        confirm = QMessageBox.question(self, "Confirm Reset", 
+                                       "This will delete all person names and groups. Are you sure?",
+                                       QMessageBox.Yes | QMessageBox.No)
+        if confirm == QMessageBox.Yes:
+            self.db.reset_all_people()
+            for i in reversed(range(self.list_layout.count())):
+                item = self.list_layout.itemAt(i)
+                if item:
+                    widget = item.widget()
+                    if widget:
+                        widget.setParent(None)
+            self.start_loading()
+
+
     def on_batch_ignore(self):
         to_ignore = [cid for cid, (cb, name) in self.check_boxes.items() if cb.isChecked()]
         if not to_ignore:
@@ -221,17 +264,13 @@ class PersonManagerDialog(QDialog):
 
         confirm = QMessageBox.question(self, "Batch Ignore", 
                                      f"Are you sure you want to ignore {len(to_ignore)} selected persons?\n"
-                                     "They will be hidden from all views.",
+                                     "Their faces will be purged and future detections of these persons will be automatically skipped.",
                                      QMessageBox.Yes | QMessageBox.No)
         if confirm == QMessageBox.Yes:
-            batch_data = []
             for cid in to_ignore:
-                name = self.check_boxes[cid][1] or ""
-                batch_data.append((cid, name, 1)) # 1 for is_ignored
+                self.db.ignore_cluster(cid)
             
-            self.db.upsert_clusters_batch(batch_data)
-            # Re-scannnig the list is difficult with progressive loading, 
-            # so we just close or hide the ignored rows. For simplicity, we refresh.
+            # Full refresh to update UI state
             while self.list_layout.count():
                 item = self.list_layout.takeAt(0)
                 if item.widget(): item.widget().deleteLater()

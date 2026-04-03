@@ -142,8 +142,9 @@ class ThumbnailDelegate(QStyledItemDelegate):
             # "Select Group" Hint
             painter.setPen(QPen(self.accent_color, 0.8))
             painter.setFont(QFont("Inter", 9, QFont.Medium))
-            painter.drawText(rect.adjusted(0, 0, -20, 0), Qt.AlignVCenter | Qt.AlignRight, "Click to Select Group")
+            painter.drawText(rect.adjusted(0, 0, -120, 0), Qt.AlignVCenter | Qt.AlignRight, "Click to Select Group")
             
+
             painter.restore()
             return
 
@@ -322,6 +323,7 @@ class ThumbnailGrid(QListView):
 
     def clear(self):
         self.media_model.clear()
+        self.selection_changed.emit(0)
 
     def append_data(self, data):
         self.media_model.append_data(data)
@@ -345,6 +347,10 @@ class ThumbnailGrid(QListView):
             return
 
         if data.get("is_header"):
+            rect = self.visualRect(index)
+            local_pos = event.pos() - rect.topLeft()
+            
+
             if data.get("group_id"):
                 self.media_model.select_group(data["group_id"], is_duplicate=True)
             elif data.get("ui_group_id"):
@@ -453,6 +459,3 @@ class ThumbnailGrid(QListView):
         return selected
 
     def set_data(self, media_list): self.media_model.set_data(media_list)
-
-    def append_data(self, media_list): self.media_model.append_data(media_list)
-    def clear(self): self.media_model.clear()

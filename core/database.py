@@ -2,6 +2,7 @@ import sqlite3
 import json
 import os
 import logging
+import numpy as np
 from .utils import get_app_data_dir
 
 logger = logging.getLogger("PhotoArrange")
@@ -98,6 +99,18 @@ class Database:
                     cluster_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     custom_name TEXT,
                     is_ignored INTEGER DEFAULT 0
+                )
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS ignored_person_vectors (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    vector_blob BLOB NOT NULL
+                )
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
                 )
             ''')
             
@@ -337,10 +350,10 @@ class Database:
         with self.get_connection() as conn:
             # Only return clusters that have at least one non-corrupted media file
             cursor = conn.execute('''
-                SELECT DISTINCT f.cluster_id 
-                FROM faces f 
+                SELECT DISTINCT f.cluster_id
+                FROM faces f
                 JOIN media m ON f.file_path = m.file_path
-                WHERE m.is_corrupted = 0
+                WHERE m.is_corrupted = 0 AND f.cluster_id IS NOT NULL AND f.cluster_id != -1
             ''')
             cids = [row[0] for row in cursor.fetchall()]
 
@@ -349,19 +362,18 @@ class Database:
                 query = 'SELECT custom_name, is_ignored FROM clusters WHERE cluster_id = ?'
                 cursor = conn.execute(query, (cid,))
                 row = cursor.fetchone()
-                
+
                 name = row[0] if row else None
                 ignored = row[1] if row else 0
-                
+
                 if not include_ignored and ignored:
                     continue
-                    
-                results.append((cid, name))
-            
-            # Sort by name (if exists) then by id
-            results.sort(key=lambda x: (x[1] if x[1] else "", x[0]))
-            return results
 
+                results.append((cid, name))
+
+            # Sort by name (if exists) then by id
+            results.sort(key=lambda x: (str(x[1]) if x[1] else "", x[0] if x[0] is not None else -1))
+            return results
     def get_faces_for_cluster(self, cluster_id):
         with self.get_connection() as conn:
             query = 'SELECT face_id, file_path, bbox_json FROM faces WHERE cluster_id = ?'
@@ -547,6 +559,36 @@ class Database:
             conn.execute('DELETE FROM faces WHERE file_path = ?', (norm_path,))
             conn.commit()
 
+    def clear_face_data(self, folder_path=None):
+        """
+        Clears face data from the 'faces' table. 
+        If folder_path is provided, only faces belonging to that folder tree are deleted.
+        If folder_path is None, both 'faces' and 'clusters' tables are emptied.
+        """
+        with self.get_connection() as conn:
+            if folder_path:
+                # Use project standard normalization
+                norm_root = os.path.normcase(os.path.abspath(folder_path))
+                if not norm_root.endswith(os.path.sep):
+                    norm_root += os.path.sep
+                
+                # ESCAPE '[' and '%' for LIKE clause
+                pattern = norm_root.replace('[', '[[]').replace('%', '[%]') + '%'
+                
+                conn.execute('DELETE FROM faces WHERE file_path LIKE ? COLLATE NOCASE', (pattern,))
+                logger.info(f"Cleared face data for folder tree: {folder_path}")
+            else:
+                conn.execute('DELETE FROM faces')
+                conn.execute('DELETE FROM clusters')
+                conn.execute('DELETE FROM ignored_person_vectors')
+                # Reset auto-increment sequences for a clean "hard" reset
+                conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('faces', 'clusters', 'ignored_person_vectors')")
+                logger.info("Cleared all face, cluster, and ignored vector data. IDs reset to 1.")
+            
+            conn.commit()
+            # Ensure consistency and sync WAL to main DB
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+
     def get_duplicate_stats(self, include_trash=False, root_folder=None, discovery_filter=None):
         trash_cond = "is_in_trash = 0" if not include_trash else "1=1"
         params = []
@@ -614,6 +656,63 @@ class Database:
             conn.execute(f"UPDATE media SET group_id = NULL {where_clause}", params)
             conn.commit()
             logger.info(f"Cleared AI duplicate groups for scope: {root_folder or 'Global'}")
+
+    def release_files_from_groups(self, file_paths):
+        """Removes duplicate group association from specified files and cleans up orphaned groups."""
+        if not file_paths:
+            # Still perform cleanup of orphaned groups even if no specific files are released
+            with self.get_connection() as conn:
+                self._cleanup_orphaned_groups(conn)
+                conn.commit()
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            return
+            
+        norm_paths = [os.path.normcase(os.path.abspath(p)) for p in file_paths]
+        
+        with self.get_connection() as conn:
+            # 1. Release specified files from their groups
+            batch_size = 500
+            for i in range(0, len(norm_paths), batch_size):
+                chunk = norm_paths[i:i + batch_size]
+                placeholders = ','.join(['?'] * len(chunk))
+                conn.execute(f"UPDATE media SET group_id = NULL WHERE file_path IN ({placeholders})", chunk)
+            
+            # 2. Cleanup
+            self._cleanup_orphaned_groups(conn)
+            
+            conn.commit()
+            # Ensure changes are synced from WAL to main DB file for UI consistency
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            logger.info(f"Released {len(norm_paths)} files from duplicate groups and cleaned up orphaned groups.")
+
+    def _cleanup_orphaned_groups(self, conn):
+        """Internal helper to clean up duplicate_groups and orphaned group_ids in media table."""
+        # 1. Cleanup duplicate_groups that no longer have at least 2 associated files
+        conn.execute("""
+            DELETE FROM duplicate_groups 
+            WHERE group_id NOT IN (
+                SELECT group_id FROM media 
+                WHERE group_id IS NOT NULL 
+                GROUP BY group_id 
+                HAVING COUNT(*) > 1
+            )
+        """)
+        
+        # 2. Clear group_id for orphaned single members in media table
+        conn.execute("""
+            UPDATE media SET group_id = NULL 
+            WHERE group_id IS NOT NULL AND group_id NOT IN (SELECT group_id FROM duplicate_groups)
+        """)
+
+    def release_duplicate_group(self, group_id):
+        """Removes all members from a specific group and purges the group record."""
+        # Find all files belonging to this group
+        with self.get_connection() as conn:
+            cursor = conn.execute("SELECT file_path FROM media WHERE group_id = ?", (group_id,))
+            file_paths = [row[0] for row in cursor.fetchall()]
+        
+        # Use release_files_from_groups to handle the updates and cleanup consistently
+        self.release_files_from_groups(file_paths)
 
     def _get_filter_clause(self, cluster_id, year, month, location, include_trash, root_folder):
         clauses = []
@@ -724,6 +823,13 @@ class Database:
             conn.execute("DELETE FROM faces WHERE face_id = ?", (face_id,))
             conn.commit()
 
+    def remove_face_batch(self, face_ids):
+        if not face_ids: return
+        with self.get_connection() as conn:
+            placeholders = ','.join(['?'] * len(face_ids))
+            conn.execute(f"DELETE FROM faces WHERE face_id IN ({placeholders})", face_ids)
+            conn.commit()
+
     def get_faces_for_file(self, file_path):
         norm_path = os.path.normcase(os.path.abspath(file_path))
         with self.get_connection() as conn:
@@ -735,4 +841,109 @@ class Database:
         with self.get_connection() as conn:
             cursor = conn.execute("SELECT cluster_id, custom_name FROM clusters WHERE is_ignored = 0")
             return cursor.fetchall()
+
+    def reset_all_people(self):
+        """
+        Deletes all clusters, ignored person vectors, and resets face cluster_ids.
+        """
+        with self.get_connection() as conn:
+            conn.execute('DELETE FROM clusters')
+            conn.execute('DELETE FROM ignored_person_vectors')
+            conn.execute('UPDATE faces SET cluster_id = NULL')
+            conn.commit()
+
+    def ignore_cluster(self, cluster_id):
+        """
+        Saves a representative vector to ignored_person_vectors, 
+        then deletes all face records and the cluster itself.
+        """
+        with self.get_connection() as conn:
+            # 1. Get a representative vector (the first one)
+            cursor = conn.execute("SELECT vector_blob FROM faces WHERE cluster_id = ? LIMIT 1", (cluster_id,))
+            row = cursor.fetchone()
+            if row:
+                vector_blob = row[0]
+                # 2. Save to ignored_person_vectors
+                conn.execute("INSERT INTO ignored_person_vectors (vector_blob) VALUES (?)", (vector_blob,))
+            
+            # 3. Delete traces
+            conn.execute("DELETE FROM faces WHERE cluster_id = ?", (cluster_id,))
+            conn.execute("DELETE FROM clusters WHERE cluster_id = ?", (cluster_id,))
+            conn.commit()
+            logger.info(f"Ignored cluster {cluster_id} and purged associated face records.")
+
+    def get_ignored_vectors(self):
+        """Returns all ignored vectors as a list of numpy arrays (float32)."""
+        with self.get_connection() as conn:
+            cursor = conn.execute("SELECT vector_blob FROM ignored_person_vectors")
+            return [np.frombuffer(row[0], dtype=np.float32) for row in cursor.fetchall()]
+
+    def get_suggested_face_merges(self, suggestion_thresh=0.65, auto_merge_thresh=0.85):
+        """
+        Finds pairs of clusters that are similar but not merged.
+        Calculation is based on the centroid (mean) of all embeddings in each cluster.
+        """
+        with self.get_connection() as conn:
+            # 1. Fetch active clusters
+            cursor = conn.execute("SELECT cluster_id FROM clusters WHERE is_ignored = 0")
+            cids = [row[0] for row in cursor.fetchall() if row[0] is not None]
+            
+            if len(cids) < 2: return []
+            
+            # 2. Fetch all embeddings grouping by cluster
+            placeholders = ','.join(['?'] * len(cids))
+            query = f"SELECT cluster_id, vector_blob FROM faces WHERE cluster_id IN ({placeholders})"
+            cursor = conn.execute(query, cids)
+            cluster_faces = {}
+            for cid, blob in cursor.fetchall():
+                if cid not in cluster_faces: cluster_faces[cid] = []
+                cluster_faces[cid].append(np.frombuffer(blob, dtype=np.float32))
+            
+            # 3. Compute Centroids (normalized means)
+            centroids = {}
+            for cid, embs in cluster_faces.items():
+                if not embs: continue
+                avg = np.mean(embs, axis=0)
+                norm = np.linalg.norm(avg)
+                if norm > 0:
+                    centroids[cid] = avg / (norm + 1e-6)
+            
+            # 4. Pairwise similarity comparison
+            suggestions = []
+            cid_list = list(centroids.keys())
+            for i in range(len(cid_list)):
+                for j in range(i + 1, len(cid_list)):
+                    c1, c2 = cid_list[i], cid_list[j]
+                    # Cosine similarity = Dot product for normalized vectors
+                    sim = float(np.dot(centroids[c1], centroids[c2]))
+                    
+                    if suggestion_thresh <= sim < auto_merge_thresh:
+                        suggestions.append((c1, c2, sim))
+            
+            # Sort by similarity descending
+            suggestions.sort(key=lambda x: x[2], reverse=True)
+            return suggestions
+
+    def merge_clusters(self, source_cluster_id, target_cluster_id, target_name=None):
+        """Consolidates two clusters into target_cluster_id."""
+        with self.get_connection() as conn:
+            # Update faces
+            conn.execute("UPDATE faces SET cluster_id = ? WHERE cluster_id = ?", (target_cluster_id, source_cluster_id))
+            # Delete old cluster record
+            conn.execute("DELETE FROM clusters WHERE cluster_id = ?", (source_cluster_id,))
+            if target_name:
+                conn.execute("UPDATE clusters SET custom_name = ? WHERE cluster_id = ?", (target_name, target_cluster_id))
+            conn.commit()
+            logger.info(f"Merged cluster {source_cluster_id} into {target_cluster_id}")
+
+    def get_setting(self, key, default=None):
+        with self.get_connection() as conn:
+            cursor = conn.execute('SELECT value FROM settings WHERE key = ?', (key,))
+            row = cursor.fetchone()
+            return row[0] if row else default
+
+    def save_setting(self, key, value):
+        with self.get_connection() as conn:
+            conn.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', (key, str(value)))
+            conn.commit()
 

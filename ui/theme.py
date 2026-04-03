@@ -209,4 +209,36 @@ def get_style_sheet():
     QSplitter::handle {
         background-color: #2D324A;
     }
+
+    /* Menu / Dropdown */
+    QMenu {
+        background-color: #1A1D2E;
+        border: 1px solid #2D324A;
+        border-radius: 4px;
+        color: #E2E4EB;
+        padding: 5px;
+    }
+
+    QMenu::item {
+        padding: 6px 30px 6px 15px;
+        border-radius: 4px;
+        margin: 1px 4px;
+    }
+
+    QMenu::item:selected {
+        background-color: #3D5AFE;
+        color: white;
+    }
+
+    QMenu::separator {
+        height: 1px;
+        background: #2D324A;
+        margin: 5px 15px;
+    }
+
+    QMenu::indicator {
+        width: 13px;
+        height: 13px;
+        margin-left: 10px;
+    }
     """

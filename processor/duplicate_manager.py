@@ -39,7 +39,7 @@ class DuplicateManager:
         self.feat_ext = feature_extractor
         self.is_cancelled = False # Track cancellation from worker thread
 
-    def find_structural_duplicates(self, threshold=0.6, include_trash=False, progress_callback=None):
+    def find_structural_duplicates(self, threshold=0.6, stage2_threshold=0.95, include_trash=False, progress_callback=None):
         """
         Performs a global multi-pass search for duplicates.
         Passes: MD5 (Pass 0), FAISS Global Vector (Pass 1), and Salient Patch Matching (Pass 2).
@@ -188,9 +188,8 @@ class DuplicateManager:
                             scores = self.feat_ext.compute_local_similarity_batch(feats1, feats2)
 
                             for idx, score in enumerate(scores):
-                                # Raising Stage 2 threshold to 0.95 for higher precision.
-                                # At 0.95, near-identical images are grouped.
-                                if score > 0.95:
+                                # Stage 2 threshold comparison
+                                if score > stage2_threshold:
                                     p1_norm, p2_norm = valid_pairs_in_batch[idx]
 
                                     if dsu.union(p1_norm, p2_norm):

@@ -143,7 +143,7 @@ class FaceLoadWorker(QThread):
         except Exception as e:
             logger.error(f"Error generating crop for {file_path}: {e}")
             return None
-one
+
 
 class FaceItem(QLabel):
     def __init__(self, face_id, file_path, pixmap, db, parent_dialog):

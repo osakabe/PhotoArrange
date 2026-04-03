@@ -1,0 +1,35 @@
+id = "photoarrange-architect-agent"
+name = "PhotoArrange Lead Architect"
+version = "1.0.0"
+schema_version = 1
+description = "PhotoArrange開発プロジェクトの要件定義、計画策定、および各専門エージェントへの指示を行う統括エージェント"
+authors = ["Your Name"]
+
+[agent]
+# エージェントの表示名と役割
+display_name = "Lead Architect"
+role = "project_manager"
+
+# 実行モデルの指定（Antigravity標準のGemini 3 Proなどを指定）
+model = "gemini-3-pro"
+temperature = 0.2  # 計画や指示のブレを少なくするため、低めに設定
+
+# 先ほど作成したプロンプトファイルをシステムインストラクションとして読み込む
+instructions_file = "gemini.md"
+
+[agent.capabilities]
+# 統括エージェントがIDE上で持つ権限（必要に応じてON/OFF）
+read_workspace = true     # プロジェクト全体のコードやファイル構成の読み取り
+write_workspace = false   # 統括は直接コードを書かず指示に徹するためfalse（安全策）
+run_commands = false      # 直接コマンドを実行させない
+manage_artifacts = true   # 計画書や指示書などのアーティファクト生成を許可
+
+# 配下のエージェントを呼び出す（タスクを委譲する）権限がある場合は有効化
+[agent.capabilities.delegation]
+enabled = true
+allowed_agents = ["ui-agent", "db-agent", "ai-cv-agent", "logic-agent"]
+
+[preferences]
+# 統括エージェント特有の振る舞い設定
+language = "ja"
+output_format = "markdown"

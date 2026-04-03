@@ -39,6 +39,7 @@ from ui.widgets.thumbnail_grid import ThumbnailGrid
 from ui.theme import get_style_sheet
 from ui.dialogs.settings_dialog import SettingsDialog
 from ui.dialogs.person_manager import PersonManagerDialog
+from ui.dialogs.face_verification import FaceVerificationDialog
 
 # Logger setup
 logging.basicConfig(
@@ -101,12 +102,13 @@ class WorkerBase(QThread):
     phase_status = Signal(str)
     finished_all = Signal(bool, str)
 
-    def __init__(self, folder_path, db, include_trash_folders=False):
+    def __init__(self, folder_path, db, include_trash_folders=False, face_det_thresh=0.35):
         super().__init__()
         self.folder_path = os.path.abspath(os.path.normpath(folder_path))
         self.db = db
         self.include_trash_folders = include_trash_folders
         self.is_cancelled = False
+        self.face_det_thresh = face_det_thresh
         from processor.image_processor import ImageProcessor
         from processor.geo_processor import GeoProcessor
         from processor.face_processor import FaceProcessor
@@ -115,7 +117,7 @@ class WorkerBase(QThread):
 
         self.img_proc = ImageProcessor()
         self.geo_proc = GeoProcessor()
-        self.face_proc = FaceProcessor()
+        self.face_proc = FaceProcessor(det_thresh=self.face_det_thresh)
         self.feat_ext = FeatureExtractor()
         self.duplicate_mgr = DuplicateManager(self.db, self.img_proc, self.feat_ext)
 
@@ -155,6 +157,9 @@ class FileSyncWorker(WorkerBase):
     Fast synchronization between disk and DB.
     Deletes orphans and adds new files as placeholders.
     """
+    def __init__(self, folder_path, db, include_trash_folders=False):
+        super().__init__(folder_path, db, include_trash_folders)
+
     def run(self):
         try:
             self.phase_status.emit("Cleaning up library...")
@@ -279,10 +284,11 @@ class FileSyncWorker(WorkerBase):
 
 class DuplicateAnalysisWorker(WorkerBase):
     """Specialized in finding duplicates. Extracts global embeddings and performs local patch matching."""
-    def __init__(self, folder_path, db, include_trash_folders=False, force_reanalyze=False, threshold=0.6):
+    def __init__(self, folder_path, db, include_trash_folders=False, force_reanalyze=False, threshold=0.6, stage2_threshold=0.95):
         super().__init__(folder_path, db, include_trash_folders)
         self.force_reanalyze = force_reanalyze
         self.threshold = threshold
+        self.stage2_threshold = stage2_threshold
 
     def run(self):
         try:
@@ -486,6 +492,7 @@ class DuplicateAnalysisWorker(WorkerBase):
                 
                 groups = self.duplicate_mgr.find_structural_duplicates(
                     threshold=self.threshold,
+                    stage2_threshold=self.stage2_threshold,
                     include_trash=self.include_trash_folders,
                     progress_callback=on_analysis_prog
                 )
@@ -504,9 +511,10 @@ class DuplicateRegroupingWorker(WorkerBase):
     Fast grouping redo: skips extraction and only performs 
     global FAISS search + salient patch verification on existing DB data.
     """
-    def __init__(self, folder_path, db, include_trash_folders=False, threshold=0.6):
+    def __init__(self, folder_path, db, include_trash_folders=False, threshold=0.6, stage2_threshold=0.95):
         super().__init__(folder_path, db, include_trash_folders)
         self.threshold = threshold
+        self.stage2_threshold = stage2_threshold
 
     def run(self):
         try:
@@ -523,6 +531,7 @@ class DuplicateRegroupingWorker(WorkerBase):
             
             groups = self.duplicate_mgr.find_structural_duplicates(
                 threshold=self.threshold,
+                stage2_threshold=self.stage2_threshold,
                 include_trash=self.include_trash_folders,
                 progress_callback=on_analysis_prog
             )
@@ -540,9 +549,12 @@ class FaceRecognitionWorker(WorkerBase):
     """
     Specialized in finding faces. Runs AI inference and clustering.
     """
-    def __init__(self, folder_path, db, include_trash_folders=False, force_reanalyze=False):
-        super().__init__(folder_path, db, include_trash_folders)
+    def __init__(self, folder_path, db, include_trash_folders=False, force_reanalyze=False, 
+                 min_samples=2, eps=0.42, det_thresh=0.35):
+        super().__init__(folder_path, db, include_trash_folders, face_det_thresh=det_thresh)
         self.force_reanalyze = force_reanalyze
+        self.min_samples = min_samples
+        self.eps = eps
 
     def run(self):
         try:
@@ -658,6 +670,12 @@ class FaceRecognitionWorker(WorkerBase):
                                     curr += 1
                             conn.commit()
 
+                # VRAM Management: Rule 7 - Clean up GPU memory every 500 items
+                if processed > 0 and processed % 500 == 0:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
                 processed += len(batch)
                 self.progress_val.emit(int(processed / total * 95))
                 elapsed = time.time() - start_time
@@ -665,12 +683,10 @@ class FaceRecognitionWorker(WorkerBase):
                 eta = int((total - processed) / speed) if speed > 0 else 0
                 self.phase_status.emit(f"AI Detecting faces {processed}/{total} - ETA: {time.strftime('%H:%M:%S', time.gmtime(eta))}")
             
-                self.phase_status.emit(f"AI Detecting faces {processed}/{total} - ETA: {time.strftime('%H:%M:%S', time.gmtime(eta))}")
-            
             if not self.is_cancelled:
                 # Reuse the dedicated clustering logic
                 self.phase_status.emit("Clustering faces into groups...")
-                clustering_logic(self.db, self.face_proc, self.folder_path)
+                clustering_logic(self.db, self.face_proc, self.folder_path, min_samples=self.min_samples, eps=self.eps)
                 self.progress_val.emit(100)
 
             # Final GPU cleanup after face recognition and clustering
@@ -688,12 +704,17 @@ class FaceClusteringWorker(WorkerBase):
     Dedicated worker for re-clustering based on existing embeddings in the DB.
     Skips the expensive image analysis phase.
     """
+    def __init__(self, folder_path, db, include_trash_folders=False, min_samples=2, eps=0.42, det_thresh=0.35):
+        super().__init__(folder_path, db, include_trash_folders, face_det_thresh=det_thresh)
+        self.min_samples = min_samples
+        self.eps = eps
+
     def run(self):
         try:
             self.phase_status.emit("Starting standalone face clustering...")
             self.progress_val.emit(10)
             
-            clustering_logic(self.db, self.face_proc, self.folder_path)
+            clustering_logic(self.db, self.face_proc, self.folder_path, min_samples=self.min_samples, eps=self.eps)
             
             self.progress_val.emit(100)
             self.finished_all.emit(True, "Standalone clustering complete.")
@@ -701,23 +722,57 @@ class FaceClusteringWorker(WorkerBase):
             logger.exception("FaceClustering Error:")
             self.finished_all.emit(False, str(e))
 
-def clustering_logic(db, face_proc, folder_path):
+
+def clustering_logic(db, face_proc, folder_path, min_samples=2, eps=0.42):
     """Shared clustering logic used by multiple workers."""
     # Use escaped pattern for folder path to avoid SQL injection/glob issues
     folder_pattern = folder_path.replace('_', '[_]').replace('%', '[%]') + "%"
+    
+    # 1. Fetch ignored vectors from DB
+    ignored_vectors = db.get_ignored_vectors()
     
     with db.get_connection() as conn:
         # Get all faces belonging to files in this folder
         query = "SELECT face_id, vector_blob FROM faces WHERE file_path LIKE ?"
         all_faces = conn.execute(query, (folder_pattern,)).fetchall()
         
-        if len(all_faces) >= 3:
-            face_ids = [f[0] for f in all_faces]
-            embeddings = [np.frombuffer(f[1], dtype=np.float32) for f in all_faces]
+        if not all_faces:
+            return
+
+        face_ids = []
+        embeddings = []
+        ignored_face_ids = []
+
+        # 2. Filter out ignored persons
+        for fid, v_blob in all_faces:
+            emb = np.frombuffer(v_blob, dtype=np.float32)
+            is_ignored = False
             
+            if ignored_vectors:
+                # Cosine Similarity check
+                # Normalize embedding for distance calculation
+                norm_emb = emb / (np.linalg.norm(emb) + 1e-6)
+                for i_vec in ignored_vectors:
+                    norm_i_vec = i_vec / (np.linalg.norm(i_vec) + 1e-6)
+                    dist = 1.0 - np.dot(norm_emb, norm_i_vec)
+                    if dist < eps: # Same person as ignored
+                        is_ignored = True
+                        break
+            
+            if is_ignored:
+                ignored_face_ids.append(fid)
+            else:
+                face_ids.append(fid)
+                embeddings.append(emb)
+
+        # 3. Purge ignored faces from DB
+        if ignored_face_ids:
+            logger.info(f"Auto-ignoring {len(ignored_face_ids)} face(s) matching ignored lists.")
+            db.remove_face_batch(ignored_face_ids)
+
+        if len(embeddings) >= min_samples:
             # DBSCAN Labels: -1 for noise, >=0 for clusters
-            # min_samples=2 allows for small family/group detection
-            labels = face_proc.cluster_faces(embeddings, min_samples=2)
+            labels = face_proc.cluster_faces(embeddings, eps=eps, min_samples=min_samples)
             
             update_batch = []
             for face_id, label in zip(face_ids, labels):
@@ -733,6 +788,65 @@ def clustering_logic(db, face_proc, folder_path):
                         conn.execute("INSERT OR IGNORE INTO clusters (cluster_id, custom_name) VALUES (?, ?)", 
                                     (l, f"Person {l+1}"))
                     conn.commit()
+
+class FaceResetWorker(QThread):
+    """
+    Worker for non-blocking face data reset. 
+    Stops ongoing analysis threads and clears face-related tables.
+    """
+    phase_status = Signal(str)
+    progress_val = Signal(int)
+    face_data_reset_finished = Signal(bool, str)
+
+    def __init__(self, db, folder_path=None, face_worker=None, cluster_worker=None):
+        super().__init__()
+        self.db = db
+        self.folder_path = folder_path
+        self.face_worker = face_worker
+        self.cluster_worker = cluster_worker
+
+    def run(self):
+        try:
+            self.phase_status.emit("Stopping ongoing face analysis...")
+            self.progress_val.emit(10)
+            
+            # Safely stop existing workers if they are still running
+            if self.face_worker and self.face_worker.isRunning():
+                self.face_worker.stop()
+                self.face_worker.wait()
+            
+            if self.cluster_worker and self.cluster_worker.isRunning():
+                self.cluster_worker.stop()
+                self.cluster_worker.wait()
+            
+            # VRAM Cleanup (Pre-reset)
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    logger.info("GPU cache cleared (Pre-face-reset).")
+            except ImportError:
+                pass
+
+            self.phase_status.emit("Clearing face data from database...")
+            self.progress_val.emit(40)
+            
+            # Perform reset (calls clear_face_data with WAL checkpoint)
+            self.db.clear_face_data(self.folder_path)
+            
+            # VRAM Management: Standard GPU cleanup after reset
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except ImportError:
+                pass
+
+            self.progress_val.emit(100)
+            self.face_data_reset_finished.emit(True, "Face data reset complete.")
+        except Exception as e:
+            logger.exception("FaceReset Error:")
+            self.face_data_reset_finished.emit(False, str(e))
 
 class CleanupWorker(QThread):
     progress_val = Signal(int)
@@ -880,11 +994,25 @@ class MainWindow(QMainWindow):
         
         self.db = Database()
         self.current_folder = None
-        self.threshold = 5        # Face threshold
-        self.dup_threshold = 6    # Duplicate threshold (0.6 L2)
+        
+        # Load settings from DB with defaults
+        self.face_det_thresh = int(self.db.get_setting("face_det_thresh", 35))
+        self.face_min_samples = int(self.db.get_setting("face_min_samples", 2))
+        self.face_cluster_eps = int(self.db.get_setting("face_cluster_eps", 42))
+        self.face_merge_threshold = int(self.db.get_setting("face_merge_threshold", 55))
+        
+        self.threshold = int(self.db.get_setting("threshold", 5))
+        self.dup_threshold = int(self.db.get_setting("dup_threshold", 6))
+        self.dup_threshold_stage2 = int(self.db.get_setting("dup_threshold_stage2", 95))
+        self.force_reanalyze = self.db.get_setting("force_reanalyze", "False") == "True"
+        self.include_trash = self.db.get_setting("include_trash", "False") == "True"
+
+        # Verification & Suggestion settings (Defaults for confirmation area)
+        self.face_suggestion_thresh = self.face_merge_threshold / 100.0  # e.g., 0.55
+        self.face_auto_merge_thresh = 0.85                               # Strict auto-merge
+        self.pending_merges = []
 
         # Pagination & Rendering state
-
         self.current_filter = {"cluster_id": None, "year": None, "month": None, "location": None}
         self.page_size = 100
         self.current_offset = 0
@@ -916,7 +1044,7 @@ class MainWindow(QMainWindow):
         header.setFixedHeight(40)
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(15, 2, 15, 2)
-        header_layout.setSpacing(10)
+        header_layout.setSpacing(15)
         
         # Left Cluster: Navigation & Info
         title_icon = QLabel("📸")
@@ -929,47 +1057,54 @@ class MainWindow(QMainWindow):
         self.btn_select = QPushButton("📂 Open Folder")
         self.btn_select.setFixedWidth(140)
         self.btn_select.setObjectName("flat")
+        self.btn_select.setToolTip("スキャン対象のフォルダを選択します。")
         self.btn_select.clicked.connect(self.select_folder)
         header_layout.addWidget(self.btn_select)
         
         header_layout.addStretch()
 
-        self.chk_force = QCheckBox("Force Re-analyze")
-        self.chk_force.setToolTip("Skip the cache and analyze everything again.")
-        header_layout.addWidget(self.chk_force)
+        # AI Operations Menu Button
+        self.btn_ai_ops = QPushButton("✨ AI機能")
+        self.btn_ai_ops.setFixedWidth(110)
+        self.btn_ai_ops.setObjectName("primary")
+        self.btn_ai_ops.setToolTip("AIを用いた重複分析や顔認識を実行します。")
         
-        self.chk_include_trash = QCheckBox("Include Trash")
-        self.chk_include_trash.setToolTip("Include files in .trash or Recycle Bin.")
-        header_layout.addWidget(self.chk_include_trash)
+        ai_menu = QMenu(self)
+        
+        self.act_dup_analysis = QAction("➕ AI分析 & 重複発見", self)
+        self.act_dup_analysis.setToolTip("ライブラリを再走査し、新しいファイルに対してAI特徴量抽出と重複分析を行います。")
+        self.act_dup_analysis.triggered.connect(self.run_duplicate_analysis)
+        ai_menu.addAction(self.act_dup_analysis)
+        
+        self.act_dup_regroup = QAction("🔄 AIグループ化のみ", self)
+        self.act_dup_regroup.setToolTip("すでに取得済みのAI特徴量を使って、新しいしきい値でグループ分けだけをやり直します。")
+        self.act_dup_regroup.triggered.connect(self.run_duplicate_regrouping)
+        ai_menu.addAction(self.act_dup_regroup)
+        
+        ai_menu.addSeparator()
+        
+        self.act_face_analysis = QAction("👤 顔認識の実行", self)
+        self.act_face_analysis.setToolTip("写真内の顔を検出し、特徴量を抽出します。")
+        self.act_face_analysis.triggered.connect(self.run_face_analysis)
+        self.act_face_analysis.setEnabled(False)
+        ai_menu.addAction(self.act_face_analysis)
+        
+        self.act_face_clustering = QAction("👥 人物グループ化", self)
+        self.act_face_clustering.setToolTip("すでに取得済みの顔情報を使って、グループ分けだけをやり直します。")
+        self.act_face_clustering.triggered.connect(self.run_face_clustering)
+        self.act_face_clustering.setEnabled(False)
+        ai_menu.addAction(self.act_face_clustering)
 
-        self.btn_dup_analysis = QPushButton("➕ AI分析 & 重複発見")
-        self.btn_dup_analysis.setFixedWidth(180)
-        self.btn_dup_analysis.setObjectName("primary")
-        self.btn_dup_analysis.setToolTip("ライブラリを再走査し、新しいファイルに対してAI特徴量抽出と重複分析を行います。")
-        self.btn_dup_analysis.clicked.connect(self.run_duplicate_analysis)
-        header_layout.addWidget(self.btn_dup_analysis)
+        ai_menu.addSeparator()
+        
+        self.act_force_toggle = QAction("🎯 強制再解析を有効にする", self)
+        self.act_force_toggle.setCheckable(True)
+        self.act_force_toggle.setChecked(self.force_reanalyze)
+        self.act_force_toggle.toggled.connect(self.update_force_reanalyze)
+        ai_menu.addAction(self.act_force_toggle)
 
-        self.btn_dup_regroup = QPushButton("🔄 AIグループ化のみ")
-        self.btn_dup_regroup.setFixedWidth(160)
-        self.btn_dup_regroup.setObjectName("primary")
-        self.btn_dup_regroup.setToolTip("すでに取得済みのAI特徴量を使って、新しいしきい値でグループ分けだけをやり直します。")
-        self.btn_dup_regroup.clicked.connect(self.run_duplicate_regrouping)
-        header_layout.addWidget(self.btn_dup_regroup)
-
-        self.btn_face_analysis = QPushButton("👤 顔認識")
-        self.btn_face_analysis.setFixedWidth(120)
-        self.btn_face_analysis.setObjectName("primary")
-        self.btn_face_analysis.setEnabled(False)
-        self.btn_face_analysis.clicked.connect(self.run_face_analysis)
-        header_layout.addWidget(self.btn_face_analysis)
-
-        self.btn_face_clustering = QPushButton("👥 人物グループ化")
-        self.btn_face_clustering.setFixedWidth(160)
-        self.btn_face_clustering.setObjectName("primary")
-        self.btn_face_clustering.setToolTip("すでに取得済みの顔情報を使って、グループ分けだけをやり直します。")
-        self.btn_face_clustering.setEnabled(False)
-        self.btn_face_clustering.clicked.connect(self.run_face_clustering)
-        header_layout.addWidget(self.btn_face_clustering)
+        self.btn_ai_ops.setMenu(ai_menu)
+        header_layout.addWidget(self.btn_ai_ops)
         
         header_layout.addStretch()
         
@@ -977,18 +1112,42 @@ class MainWindow(QMainWindow):
         self.btn_people = QPushButton("👥 People")
         self.btn_people.setObjectName("flat")
         self.btn_people.setFixedWidth(100)
+        self.btn_people.setToolTip("人物リストの管理と名前の変更を行います。")
         self.btn_people.clicked.connect(self.show_person_manager)
         header_layout.addWidget(self.btn_people)
 
         self.btn_face_organizer = QPushButton("👤 Organizer")
         self.btn_face_organizer.setObjectName("flat")
         self.btn_face_organizer.setFixedWidth(110)
+        self.btn_face_organizer.setToolTip("顔写真の整理と人物への割り当てを行います。")
         self.btn_face_organizer.clicked.connect(self.show_face_organizer)
         header_layout.addWidget(self.btn_face_organizer)
+
+        # Notification Badge
+        self.btn_notif = QPushButton("💡 0")
+        self.btn_notif.setObjectName("flat")
+        self.btn_notif.setFixedWidth(80)
+        self.btn_notif.setVisible(False)
+        self.btn_notif.setToolTip("同一人物の可能性があるペアが見つかりました。確認するにはクリックしてください。")
+        self.btn_notif.setStyleSheet("""
+            QPushButton { 
+                color: #FFD600; 
+                font-weight: bold; 
+                border: 1px solid #FFD600; 
+                border-radius: 4px; 
+                padding: 2px 5px;
+            }
+            QPushButton:hover {
+                background-color: rgba(255, 214, 0, 0.1);
+            }
+        """)
+        self.btn_notif.clicked.connect(self.show_face_verification)
+        header_layout.addWidget(self.btn_notif)
 
         self.btn_settings = QPushButton("⚙️")
         self.btn_settings.setObjectName("flat")
         self.btn_settings.setFixedWidth(40)
+        self.btn_settings.setToolTip("アプリケーションの設定（閾値など）を変更します。")
         self.btn_settings.clicked.connect(self.show_settings)
         header_layout.addWidget(self.btn_settings)
 
@@ -1056,6 +1215,13 @@ class MainWindow(QMainWindow):
         self.btn_cleanup.setVisible(False)
         self.btn_cleanup.clicked.connect(self.cleanup_duplicates)
         sub_layout.addWidget(self.btn_cleanup)
+
+        self.btn_release_from_group = QPushButton("🔗 重複から除外")
+        self.btn_release_from_group.setFixedWidth(140)
+        self.btn_release_from_group.setEnabled(False)
+        self.btn_release_from_group.setToolTip("選択された写真を重複グループから除外します。")
+        self.btn_release_from_group.clicked.connect(self.release_selected_from_groups)
+        sub_layout.addWidget(self.btn_release_from_group)
         
         self.btn_delete_selected = QPushButton("🗑️ Delete")
         self.btn_delete_selected.setObjectName("danger")
@@ -1113,7 +1279,7 @@ class MainWindow(QMainWindow):
             self.progress_bar.setValue(0)
             self.set_buttons_enabled(False)
 
-            include_trash = self.chk_include_trash.isChecked()
+            include_trash = self.include_trash
             self.sync_worker = FileSyncWorker(folder, self.db, include_trash_folders=include_trash)
             self.sync_worker.progress_val.connect(self.progress_bar.setValue)
             self.sync_worker.phase_status.connect(self.status_label.setText)
@@ -1126,6 +1292,7 @@ class MainWindow(QMainWindow):
         if success:
             self.initialize_tree()
             self.show_images_paged()
+            self.update_verification_badge()
             self.status_label.setText(f"Sync complete. Ready.")
         else:
             QMessageBox.critical(self, "Sync Error", f"Failed to sync folder: {message}")
@@ -1134,10 +1301,16 @@ class MainWindow(QMainWindow):
     def set_buttons_enabled(self, enabled):
         # Header Controls
         self.btn_select.setEnabled(enabled)
-        self.btn_dup_analysis.setEnabled(enabled)
-        self.btn_dup_regroup.setEnabled(enabled)
-        self.btn_face_analysis.setEnabled(enabled)
-        self.btn_face_clustering.setEnabled(enabled)
+        self.btn_ai_ops.setEnabled(enabled)
+        
+        # Actions inside AI Menu
+        self.act_dup_analysis.setEnabled(enabled)
+        self.act_dup_regroup.setEnabled(enabled)
+        # Face analysis is always enabled once folder is selected
+        self.act_face_analysis.setEnabled(enabled)
+        self.act_face_clustering.setEnabled(enabled)
+
+        # Management Controls
         self.btn_people.setEnabled(enabled)
         self.btn_face_organizer.setEnabled(enabled)
         self.btn_settings.setEnabled(enabled)
@@ -1155,17 +1328,20 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 100)
         self.set_buttons_enabled(False)
 
-        force = self.chk_force.isChecked()
-        include_trash = self.chk_include_trash.isChecked()
+        force = self.force_reanalyze
+        include_trash = self.include_trash
 
         # Map UI threshold (1-15) to L2 distance (0.1-1.5)
         # 6 on slider = 0.6 L2 (standard)
         l2_thresh = self.dup_threshold / 10.0
+        # Stage 2: 95 on slider = 0.95 patch similarity
+        stage2_thresh = self.dup_threshold_stage2 / 100.0
 
         self.analysis_worker = DuplicateAnalysisWorker(self.current_folder, self.db,
                                                        include_trash_folders=include_trash,
                                                        force_reanalyze=force,
-                                                       threshold=l2_thresh)
+                                                       threshold=l2_thresh,
+                                                       stage2_threshold=stage2_thresh)
         self.analysis_worker.progress_val.connect(self.progress_bar.setValue)
         self.analysis_worker.phase_status.connect(self.status_label.setText)
         self.analysis_worker.finished_all.connect(self.on_analysis_finished)
@@ -1177,34 +1353,59 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 100)
         self.set_buttons_enabled(False)
 
-        include_trash = self.chk_include_trash.isChecked()
+        include_trash = self.include_trash
 
         # Map UI threshold (1-15) to L2 distance (0.1-1.5)
         l2_thresh = self.dup_threshold / 10.0
+        # Stage 2: 95 on slider = 0.95 patch similarity
+        stage2_thresh = self.dup_threshold_stage2 / 100.0
 
         self.regroup_worker = DuplicateRegroupingWorker(self.current_folder, self.db,
                                                        include_trash_folders=include_trash,
-                                                       threshold=l2_thresh)
+                                                       threshold=l2_thresh,
+                                                       stage2_threshold=stage2_thresh)
         self.regroup_worker.progress_val.connect(self.progress_bar.setValue)
         self.regroup_worker.phase_status.connect(self.status_label.setText)
         self.regroup_worker.finished_all.connect(self.on_analysis_finished)
         self.regroup_worker.start()
     def run_face_analysis(self):
         if not self.current_folder: return
+
+        logger.info(f"Face Recognition started. Force Re-analyze: {self.force_reanalyze}")
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        QApplication.processEvents() # Force UI update before AI init
         self.set_buttons_enabled(False)
-        
-        force = self.chk_force.isChecked()
-        include_trash = self.chk_include_trash.isChecked()
-        
-        self.analysis_worker = FaceRecognitionWorker(self.current_folder, self.db, 
-                                                    include_trash_folders=include_trash,
-                                                    force_reanalyze=force)
-        self.analysis_worker.progress_val.connect(self.progress_bar.setValue)
-        self.analysis_worker.phase_status.connect(self.status_label.setText)
-        self.analysis_worker.finished_all.connect(self.on_analysis_finished)
-        self.analysis_worker.start()
+
+        # Stop existing worker safely if it's still running
+        if hasattr(self, 'face_worker') and self.face_worker.isRunning():
+            logger.info("Stopping existing face analysis worker before restart...")
+            self.face_worker.stop()
+            self.face_worker.wait()
+
+        force = self.force_reanalyze
+        include_trash = self.include_trash
+
+        try:
+            self.face_worker = FaceRecognitionWorker(
+                self.current_folder, self.db,
+                include_trash_folders=include_trash,
+                force_reanalyze=force,
+                min_samples=self.face_min_samples,
+                eps=self.face_cluster_eps / 100.0,
+                det_thresh=self.face_det_thresh / 100.0
+            )
+            self.face_worker.progress_val.connect(self.progress_bar.setValue)
+            self.face_worker.phase_status.connect(self.status_label.setText)
+            self.face_worker.finished_all.connect(self.on_analysis_finished)
+            self.face_worker.start()
+            logger.info("Face Recognition Worker thread started.")
+        except Exception as e:
+            logger.exception(f"Failed to start Face Recognition Worker: {e}")
+            self.set_buttons_enabled(True)
+            self.progress_bar.setVisible(False)
+            self.status_label.setText(f"Error starting face analysis: {e}")
 
     def run_face_clustering(self):
         if not self.current_folder: return
@@ -1212,7 +1413,13 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 100)
         self.set_buttons_enabled(False)
         
-        self.cluster_worker = FaceClusteringWorker(self.current_folder, self.db)
+        self.cluster_worker = FaceClusteringWorker(
+            self.current_folder, self.db, 
+            include_trash_folders=self.include_trash,
+            min_samples=self.face_min_samples,
+            eps=self.face_cluster_eps / 100.0,
+            det_thresh=self.face_det_thresh / 100.0
+        )
         self.cluster_worker.progress_val.connect(self.progress_bar.setValue)
         self.cluster_worker.phase_status.connect(self.status_label.setText)
         self.cluster_worker.finished_all.connect(self.on_analysis_finished)
@@ -1227,7 +1434,7 @@ class MainWindow(QMainWindow):
         self.tree_view.initialize_categories(categories)
 
     def on_tree_load_request(self, item, level, params):
-        include_trash = self.chk_include_trash.isChecked()
+        include_trash = self.include_trash
         if level == "years":
             cid = params.get("cluster_id")
             years = self.db.get_years(cid, include_trash=include_trash)
@@ -1246,6 +1453,8 @@ class MainWindow(QMainWindow):
 
     def on_tree_selection(self, index):
         item = self.tree_view.model.itemFromIndex(index)
+        if not item:
+            return
         itype = item.data(Qt.UserRole + 2)
         
         cid = None
@@ -1256,12 +1465,17 @@ class MainWindow(QMainWindow):
         if itype == "category":
             cid = item.data(Qt.UserRole)
         elif itype == "years":
-            cid = item.parent().data(Qt.UserRole)
+            p = item.parent()
+            cid = p.data(Qt.UserRole) if p else None
             year = item.data(Qt.UserRole + 4)
         elif itype == "months":
-            cid, year, month = item.data(Qt.UserRole + 1)
+            data = item.data(Qt.UserRole + 1)
+            if data and len(data) >= 3:
+                cid, year, month = data[:3]
         elif itype == "locations":
-            cid, year, month, location = item.data(Qt.UserRole + 1)
+            data = item.data(Qt.UserRole + 1)
+            if data and len(data) >= 4:
+                cid, year, month, location = data[:4]
         
         self.current_filter = {"cluster_id": cid, "year": year, "month": month, "location": location}
         self.btn_cleanup.setVisible(cid == -2)
@@ -1274,7 +1488,7 @@ class MainWindow(QMainWindow):
             status_text = "Showing Media with No Faces Detected"
         elif cid == -2: 
             d_filter = self.get_current_discovery_filter()
-            stats = self.db.get_duplicate_stats(include_trash=self.chk_include_trash.isChecked(),
+            stats = self.db.get_duplicate_stats(include_trash=self.include_trash,
                                               root_folder=self.current_folder,
                                               discovery_filter=d_filter)
             group_cnt, total_files, counts = stats
@@ -1322,15 +1536,16 @@ class MainWindow(QMainWindow):
 
 
     def show_images_paged(self):
-        # Cancel any pending load
+        # Cancel any pending load and WAIT for it to stop to avoid "clogging"
         if hasattr(self, 'data_loader') and self.data_loader.isRunning():
             self.data_loader.terminate()
             self.data_loader.wait()
 
         self.current_offset = 0
         self.grid_view.clear()
+        QApplication.processEvents()  # Force model reset and UI update
         self.has_more = True
-        self.is_loading_more = False
+        self.is_loading_more = False # Reset flag to allow first page load
         
         # Reset grouping state for new views
         self.last_hash = None
@@ -1341,6 +1556,34 @@ class MainWindow(QMainWindow):
         
         self.load_next_page()
 
+    def update_verification_badge(self):
+        """Checks DB for suggested merges and updates the UI badge."""
+        try:
+            # We use local thresholds which can be updated later from settings
+            self.pending_merges = self.db.get_suggested_face_merges(
+                suggestion_thresh=self.face_suggestion_thresh,
+                auto_merge_thresh=self.face_auto_merge_thresh
+            )
+            count = len(self.pending_merges)
+            if count > 0:
+                self.btn_notif.setText(f"💡 {count}")
+                self.btn_notif.setVisible(True)
+            else:
+                self.btn_notif.setVisible(False)
+        except Exception as e:
+            logger.error(f"Failed to update verification badge: {e}")
+
+    def show_face_verification(self):
+        if not self.pending_merges:
+            return
+            
+        dlg = FaceVerificationDialog(self.db, self.pending_merges, self)
+        if dlg.exec():
+            # Refresh tree and grid if merges happened
+            self.initialize_tree()
+            self.on_tree_selection(self.tree_view.currentIndex())
+            self.update_verification_badge()
+
     def load_next_page(self):
         # Prevent parallel loading
         if self.is_loading_more or not self.has_more:
@@ -1350,7 +1593,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Loading more media...")
 
         f = self.current_filter
-        include_trash = self.chk_include_trash.isChecked()
+        include_trash = self.include_trash
         d_filter = self.get_current_discovery_filter()
         
         self.data_loader = DataLoaderWorker(self.db, f, self.page_size, self.current_offset,
@@ -1365,93 +1608,93 @@ class MainWindow(QMainWindow):
 
     def on_data_loaded(self, media, has_more):
         self.has_more = has_more
-        self.is_loading_more = False
         self.status_label.setText("") # Clear loading status
         
-        if not media:
-            if self.current_offset == 0:
-                self.info_label.setText("No media found.")
+        try:
+            if not media:
+                if self.current_offset == 0:
+                    self.info_label.setText("No media found.")
+                else:
+                    self.status_label.setText("No more items to load.")
+                return
             else:
-                self.status_label.setText("No more items to load.")
-            return
-        else:
+                # Prepare data for model
+                display_data = []
+                f = self.current_filter
+                is_dupe_view = (f.get("cluster_id") == -2)
+                
+                from processor.image_processor import ImageProcessor
+                img_proc = ImageProcessor()
+                
+                for item in media:
+                    # Use DB cached thumbnail path or calculate fallback
+                    if not item.get("thumbnail_path"):
+                        item["thumbnail_path"] = img_proc.get_thumbnail_path(item["file_path"])
+                    
+                    raw_h = item.get("group_id")
+                    # Normalize hash for robust UI grouping (strip/lowercase)
+                    current_h = raw_h.strip().lower() if raw_h else None
+                    is_duplicate = item.get("is_duplicate", False)
+                    meta = item.get("metadata", {})
+                    
+                    # Assign Group IDs to all duplicates (even in non-dupe view for badges)
+                    if is_duplicate and current_h:
+                        if current_h not in self.hash_to_id:
+                            self.hash_to_id[current_h] = self.next_group_id
+                            self.next_group_id += 1
+                        item["ui_group_id"] = self.hash_to_id[current_h]
+                    
+                    # Identify Location Label (Prefer normalized fields from DB)
+                    country = item.get("country") or meta.get("country", "")
+                    pref = item.get("prefecture") or meta.get("prefecture", "")
+                    city = item.get("city") or meta.get("city", "")
+                    
+                    # Format: "Prefecture, City" or "Country, City"
+                    if country in ["Japan", "日本", "JP"]:
+                        loc_label = f"{pref}, {city}" if pref and city else (pref or city)
+                    else:
+                        loc_label = f"{country}, {city}" if country and city else (country or city)
+                    
+                    if not loc_label or loc_label.strip() == ",": loc_label = "Unknown Location"
+                    
+                    # Extract YYYY-MM-DD from capture_date for day-based grouping
+                    cap_date = item.get("capture_date") or ""
+                    current_date_str = cap_date.split(' ')[0] if cap_date else "Unknown Date"
 
-            # Prepare data for model
-            display_data = []
-            f = self.current_filter
-            is_dupe_view = (f.get("cluster_id") == -2)
-            
-            from processor.image_processor import ImageProcessor
-            img_proc = ImageProcessor()
-            
-            for item in media:
-                # Use DB cached thumbnail path or calculate fallback
-                if not item.get("thumbnail_path"):
-                    item["thumbnail_path"] = img_proc.get_thumbnail_path(item["file_path"])
-                
-                raw_h = item.get("group_id")
-                # Normalize hash for robust UI grouping (strip/lowercase)
-                current_h = raw_h.strip().lower() if raw_h else None
-                is_duplicate = item.get("is_duplicate", False)
-                meta = item.get("metadata", {})
-                
-                # Assign Group IDs to all duplicates (even in non-dupe view for badges)
-                if is_duplicate and current_h:
-                    if current_h not in self.hash_to_id:
-                        self.hash_to_id[current_h] = self.next_group_id
-                        self.next_group_id += 1
-                    item["ui_group_id"] = self.hash_to_id[current_h]
-                
-                # Identify Location Label (Prefer normalized fields from DB)
-                country = item.get("country") or meta.get("country", "")
-                pref = item.get("prefecture") or meta.get("prefecture", "")
-                city = item.get("city") or meta.get("city", "")
-                
-                # Format: "Prefecture, City" or "Country, City"
-                if country in ["Japan", "日本", "JP"]:
-                    loc_label = f"{pref}, {city}" if pref and city else (pref or city)
-                else:
-                    loc_label = f"{country}, {city}" if country and city else (country or city)
-                
-                if not loc_label or loc_label.strip() == ",": loc_label = "Unknown Location"
-                
-                # Extract YYYY-MM-DD from capture_date for day-based grouping
-                cap_date = item.get("capture_date") or ""
-                current_date_str = cap_date.split(' ')[0] if cap_date else "Unknown Date"
+                    # Inject Headers based on view type
+                    if is_dupe_view:
+                        # Robust check for hashes (ensuring no NULL grouping spills)
+                        if current_h and current_h != "none" and current_h != self.last_hash:
+                            display_data.append({
+                                "is_header": True,
+                                "ui_group_id": item.get("ui_group_id"),
+                                "group_id": current_h
+                            })
+                            self.last_hash = current_h
+                    else:
+                        # Non-duplicate view: show location + date headers
+                        # Trigger a new header if either location OR date changes
+                        if not f.get("location") and (loc_label != self.last_loc or current_date_str != self.last_date):
+                            display_data.append({
+                                "is_header": True,
+                                "location_header": loc_label,
+                                "date_header": current_date_str
+                            })
+                            self.last_loc = loc_label
+                            self.last_date = current_date_str
+                    
+                    display_data.append(item)
 
-                # Inject Headers based on view type
-                if is_dupe_view:
-                    # Robust check for hashes (ensuring no NULL grouping spills)
-                    if current_h and current_h != "none" and current_h != self.last_hash:
-                        display_data.append({
-                            "is_header": True,
-                            "ui_group_id": item.get("ui_group_id"),
-                            "group_id": current_h
-                        })
-                        self.last_hash = current_h
-                else:
-                    # Non-duplicate view: show location + date headers
-                    # Trigger a new header if either location OR date changes
-                    if not f.get("location") and (loc_label != self.last_loc or current_date_str != self.last_date):
-                        display_data.append({
-                            "is_header": True,
-                            "location_header": loc_label,
-                            "date_header": current_date_str
-                        })
-                        self.last_loc = loc_label
-                        self.last_date = current_date_str
-                
-                display_data.append(item)
+                self.grid_view.append_data(display_data)
+                self.current_offset += len(media)
+                self.status_label.setText(f"Loaded {self.current_offset} items")
 
-            self.grid_view.append_data(display_data)
-            self.current_offset += len(media)
+        finally:
             self.is_loading_more = False
-            self.status_label.setText(f"Loaded {self.current_offset} items")
 
-            # [Aggressive Prefetching] If this was the first page and more exist, 
-            # immediately trigger loading for the next page in background.
-            if self.current_offset == self.page_size and self.has_more:
-                self.load_next_page()
+        # [Aggressive Prefetching] Moved out of try-finally to avoid being blocked by is_loading_more
+        if self.current_offset == self.page_size and self.has_more:
+            self.load_next_page()
 
     
     def cleanup_duplicates(self):
@@ -1461,7 +1704,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0) # Indeterminate phase
         
-        include_trash = self.chk_include_trash.isChecked()
+        include_trash = self.include_trash
         # Use scaled threshold (L2 0.1 - 1.5)
         l2_thresh = self.dup_threshold / 10.0
         self.search_worker = SearchWorker(self.db, include_trash=include_trash, threshold=l2_thresh)
@@ -1513,11 +1756,55 @@ class MainWindow(QMainWindow):
         
         self.is_loading_more = False
         # self.btn_load_more.setEnabled(True) # This button doesn't exist anymore
+
+    def release_selected_from_groups(self):
+        """Removes selected files from their respective duplicate groups."""
+        selected = self.grid_view.get_selected_files()
+        if not selected:
+            return
+
+        reply = QMessageBox.question(
+            self, "重複から除外",
+            f"選択された{len(selected)}枚の写真を重複グループから除外しますか？\n（ファイル自体は削除されません）",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+
+        if reply == QMessageBox.Yes:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                # 1. Store current selection context to restore after tree refresh
+                current_cid = self.current_filter.get("cluster_id")
+                
+                # 2. Database update
+                self.db.release_files_from_groups(selected)
+                
+                # 3. Clear visual selection
+                self.grid_view.select_all(False)
+                
+                # 4. Refresh sidebar tree (This wipes current index in the view)
+                self.initialize_tree()
+                
+                # 5. Restore tree selection and refresh grid
+                if current_cid is not None:
+                    target_item = self.tree_view.find_category_item(current_cid)
+                    if target_item:
+                        self.tree_view.setCurrentIndex(target_item.index())
+                        self.on_tree_selection(target_item.index())
+                    else:
+                        self.show_images_paged()
+                else:
+                    self.show_images_paged()
+                    
+            finally:
+                QApplication.restoreOverrideCursor()
         # self.btn_load_more.setText("Load More...") # This button doesn't exist anymore
 
     def on_analysis_finished(self, success, message):
         self.progress_bar.setVisible(False)
         self.set_buttons_enabled(True)
+        
+        # Update face verification suggestions
+        self.update_verification_badge()
         
         # Capture current selection cluster_id to restore view context
         selected_cid = None
@@ -1567,10 +1854,30 @@ class MainWindow(QMainWindow):
             subprocess.call(['open', file_path])
 
     def show_settings(self):
-        dialog = SettingsDialog(self.threshold, self.dup_threshold, self)
+        dialog = SettingsDialog(
+            current_threshold=self.threshold,
+            face_det_thresh=self.face_det_thresh,
+            face_min_samples=self.face_min_samples,
+            face_cluster_eps=self.face_cluster_eps,
+            face_merge_threshold=self.face_merge_threshold,
+            current_dup_threshold=self.dup_threshold,
+            current_dup_threshold_stage2=self.dup_threshold_stage2,
+            force_reanalyze=self.force_reanalyze,
+            include_trash=self.include_trash,
+            parent=self
+        )
+        dialog.face_det_thresh_changed.connect(self.update_face_det_thresh)
+        dialog.face_min_samples_changed.connect(self.update_face_min_samples)
+        dialog.face_cluster_eps_changed.connect(self.update_face_cluster_eps)
+        dialog.face_merge_threshold_changed.connect(self.update_face_merge_threshold)
+        
         dialog.settings_changed.connect(self.update_threshold)
         dialog.dup_threshold_changed.connect(self.update_dup_threshold)
+        dialog.dup_threshold_stage2_changed.connect(self.update_dup_threshold_stage2)
+        dialog.force_reanalyze_changed.connect(self.update_force_reanalyze)
+        dialog.include_trash_changed.connect(self.update_include_trash)
         dialog.data_reset.connect(self.reset_all)
+        dialog.face_data_reset_requested.connect(self.run_face_data_reset)
         dialog.exec()
 
     def show_person_manager(self):
@@ -1607,17 +1914,148 @@ class MainWindow(QMainWindow):
 
 
 
+    def update_face_det_thresh(self, val):
+        self.face_det_thresh = val
+        self.db.save_setting("face_det_thresh", val)
+
+    def update_face_min_samples(self, val):
+        self.face_min_samples = val
+        self.db.save_setting("face_min_samples", val)
+
+    def update_face_cluster_eps(self, val):
+        self.face_cluster_eps = val
+        self.db.save_setting("face_cluster_eps", val)
+
+    def update_face_merge_threshold(self, val):
+        self.face_merge_threshold = val
+        self.db.save_setting("face_merge_threshold", val)
+
     def update_threshold(self, val):
         self.threshold = val
+        self.db.save_setting("threshold", val)
 
     def update_dup_threshold(self, val):
         self.dup_threshold = val
+        self.db.save_setting("dup_threshold", val)
+
+    def update_dup_threshold_stage2(self, val):
+        self.dup_threshold_stage2 = val
+        self.db.save_setting("dup_threshold_stage2", val)
+
+    def update_force_reanalyze(self, val):
+        self.force_reanalyze = val
+        self.db.save_setting("force_reanalyze", str(val))
+        if hasattr(self, 'act_force_toggle'):
+            self.act_force_toggle.blockSignals(True)
+            self.act_force_toggle.setChecked(val)
+            self.act_force_toggle.blockSignals(False)
+
+    def update_include_trash(self, val):
+        self.include_trash = val
+        self.db.save_setting("include_trash", str(val))
+        # If folder already selected, refresh tree to show/hide trashed items
+        if self.current_folder:
+            self.initialize_tree()
+            self.show_images_paged()
+
+    def run_face_data_reset(self):
+        """Initiates the asynchronous face data reset process."""
+        if not self.current_folder: 
+            # Even without a folder, we might want to clear global data
+            pass
+
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 100)
+        self.set_buttons_enabled(False)
+        
+        # Instantiate the more robust FaceResetWorker
+        self.reset_worker = FaceResetWorker(
+            self.db, 
+            folder_path=None, # Global reset as requested by Settings
+            face_worker=getattr(self, 'face_worker', None),
+            cluster_worker=getattr(self, 'cluster_worker', None)
+        )
+        self.reset_worker.progress_val.connect(self.progress_bar.setValue)
+        self.reset_worker.phase_status.connect(self.status_label.setText)
+        self.reset_worker.face_data_reset_finished.connect(self.on_face_data_reset_finished)
+        self.reset_worker.start()
+
+    def on_face_data_reset_finished(self, success, message):
+        """Handles completion of the face data reset and refreshes the UI."""
+        self.progress_bar.setVisible(False)
+        self.set_buttons_enabled(True)
+        
+        if success:
+            # 1. Clear internal caches for faces/clusters
+            self.pending_merges = []
+            self.update_verification_badge()
+            
+            # 2. Refresh the person/category tree (Sidebar)
+            self.initialize_tree()
+            
+            # 3. Refresh the current view (Grid & Badges)
+            self.show_images_paged()
+            
+            # 4. If PersonManagerDialog is currently open, trigger its refresh logic
+            # Search for any active PersonManagerDialog instances
+            for widget in QApplication.topLevelWidgets():
+                if isinstance(widget, PersonManagerDialog) and widget.isVisible():
+                    widget.start_loading()
+            
+            QMessageBox.information(self, "Reset Complete", message)
+        else:
+            self.status_label.setText("Reset failed.")
+            QMessageBox.critical(self, "Reset Error", message)
 
     def reset_all(self):
+        # 1. Stop all active workers to prevent DB locks and resource leakage
+        workers = [
+            'sync_worker', 'analysis_worker', 'regroup_worker', 
+            'face_worker', 'cluster_worker', 'search_worker', 'data_loader'
+        ]
+        for w_name in workers:
+            if hasattr(self, w_name):
+                worker = getattr(self, w_name)
+                if worker and worker.isRunning():
+                    logger.info(f"Stopping {w_name} for reset...")
+                    worker.terminate()
+                    worker.wait()
+
+        # 2. VRAM Cleanup (Pre-reset)
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                logger.info("GPU cache cleared (Pre-reset).")
+        except ImportError:
+            pass
+
+        # 3. Database & UI State Reset
         self.db.clear_all_data()
+        
+        # Reset internal UI caches
+        self.all_people = []
+        self.pending_merges = []
+        self.hash_to_id = {}
+        self.next_group_id = 1
+        self.last_hash = None
+        self.last_loc = None
+        self.last_date = None
+        
+        # Clear Views
         self.grid_view.clear()
         self.initialize_tree()
-        self.status_label.setText("All cache cleared.")
+        
+        # 4. VRAM Cleanup (Post-reset)
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                logger.info("GPU cache cleared (Post-reset).")
+        except ImportError:
+            pass
+
+        self.status_label.setText("All cache cleared and resources released.")
 
     def delete_selected(self):
         selected = self.grid_view.get_selected_files()
@@ -1671,6 +2109,7 @@ class MainWindow(QMainWindow):
         """Update buttons based on the number of selected items."""
         has_selection = count > 0
         self.btn_delete_selected.setEnabled(has_selection)
+        self.btn_release_from_group.setEnabled(has_selection)
         self.btn_clear_tags.setEnabled(has_selection)
         
         if has_selection:
@@ -1728,6 +2167,25 @@ class MainWindow(QMainWindow):
     def remove_specific_tag(self, face_id):
         self.db.remove_face(face_id)
         self.show_images_paged()
+
+    def on_release_duplicate_group(self, group_id):
+        confirm = QMessageBox.question(
+            self,
+            "重複グループの解除",
+            "このグループの重複関係を解除しますか？\n解除されたファイルは個別のファイルとして扱われ、自動クリーンアップの対象から外れます。",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if confirm == QMessageBox.Yes:
+            self.db.release_duplicate_group(group_id)
+            
+            # Clear selection
+            self.grid_view.select_all(False)
+            
+            # Re-fetch sidebar stats if needed
+            self.initialize_tree()
+            
+            # Force grid refresh directly instead of relying on tree index (which might have changed)
+            self.show_images_paged()
 
     def show_thumbnail_context_menu(self, file_path, global_pos):
         menu = QMenu(self)
@@ -1868,4 +2326,8 @@ if __name__ == "__main__":
         except:
             pass
         sys.exit(1)
+
+
+
+
 
