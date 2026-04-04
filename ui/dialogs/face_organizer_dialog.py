@@ -78,11 +78,12 @@ class FaceLoadWorker(QThread):
         is_video = file_path.lower().endswith(('.mp4', '.avi', '.mov', '.mkv'))
         
         try:
-            if is_video and frame_idx > 0:
-                # For videos, extract the specific frame if it's not the first one
+            if is_video:
+                # For videos, extract the specific frame
                 import cv2
                 cap = cv2.VideoCapture(file_path)
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                if frame_idx > 0:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
                 success, frame = cap.read()
                 cap.release()
                 if success:

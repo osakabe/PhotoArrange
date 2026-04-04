@@ -15,7 +15,7 @@ import json
 from datetime import datetime
 from PIL import Image
 
-from core.utils import get_app_data_dir
+from core.utils import get_app_data_dir, get_face_cache_dir
 
 
 
@@ -34,12 +34,14 @@ from PySide6.QtGui import QIcon, QAction
 
 # Local imports
 from core.database import Database
+from processor.person_logic import PersonManagementWorker, PersonAction
 from ui.widgets.tree_view import MediaTreeView
 from ui.widgets.thumbnail_grid import ThumbnailGrid
 from ui.theme import get_style_sheet
 from ui.dialogs.settings_dialog import SettingsDialog
 from ui.dialogs.person_manager import PersonManagerDialog
 from ui.dialogs.face_verification import FaceVerificationDialog
+from ui.widgets.face_manager_view import FaceManagerView
 
 # Logger setup
 logging.basicConfig(
@@ -592,7 +594,7 @@ class FaceRecognitionWorker(WorkerBase):
                             if cached and cached[1] == mtime and not self.force_reanalyze and has_faces and thumb_exists:
                                 return ("CACHED", file_path)
 
-                            is_video = file_path.lower().endswith(('.mp4', '.avi', '.mov'))
+                            is_video = file_path.lower().endswith(('.mp4', '.avi', '.mov', '.mkv'))
                             p_img = None
                             if is_video:
                                 p_img = self.img_proc.extract_video_frames(file_path, num_frames=3)
@@ -600,6 +602,7 @@ class FaceRecognitionWorker(WorkerBase):
                                 p_img = self.face_proc.preprocess_image(file_path)
                             
                             # Ensure thumbnail exists during face analysis too
+                            # Rule 2: Use low-res source for speed
                             self.img_proc.generate_thumbnail(file_path)
                             
                             return ("NEW", file_path, p_img, is_video)
@@ -654,19 +657,45 @@ class FaceRecognitionWorker(WorkerBase):
                     if all_imgs:
                         raw_results = self.face_proc.detect_faces_batch(all_imgs)
                         curr = 0
+                        face_cache_dir = get_face_cache_dir()
+                        import cv2
+
                         with self.db.get_connection() as conn:
                             for f_path, indices in mapping:
-                                # Clear old faces if force_reanalyze
                                 if self.force_reanalyze:
                                     conn.execute("DELETE FROM faces WHERE file_path = ?", (f_path,))
                                 
                                 for idx in indices:
+                                    img_cv = all_imgs[curr]
                                     frame_res = raw_results[curr]
+                                    ih, iw = img_cv.shape[:2]
+
                                     for face in frame_res:
-                                        conn.execute('''
+                                        # 1. Save record to DB
+                                        cursor = conn.execute('''
                                             INSERT INTO faces (file_path, vector_blob, bbox_json, frame_index)
                                             VALUES (?, ?, ?, ?)
                                         ''', (f_path, face['embedding'].tobytes(), json.dumps(face['bbox']), idx))
+                                        
+                                        face_id = cursor.lastrowid
+                                        
+                                        # 2. Extract and Save Crop (Pre-emptive Caching)
+                                        try:
+                                            x1, y1, x2, y2 = face['bbox']
+                                            w, h = x2 - x1, y2 - y1
+                                            # Add padding (30%)
+                                            px1, py1 = max(0, x1 - w * 0.3), max(0, y1 - h * 0.3)
+                                            px2, py2 = min(iw, x2 + w * 0.3), min(ih, y2 + h * 0.3)
+                                            
+                                            crop = img_cv[int(py1):int(py2), int(px1):int(px2)]
+                                            if crop.size > 0:
+                                                crop = cv2.resize(crop, (160, 160), interpolation=cv2.INTER_AREA)
+                                                cache_path = os.path.join(face_cache_dir, f"face_{face_id}.jpg")
+                                                _, buf = cv2.imencode('.jpg', crop)
+                                                buf.tofile(cache_path)
+                                        except Exception as ce:
+                                            logger.warning(f"Failed to pre-generate crop for face {face_id}: {ce}")
+                                        
                                     curr += 1
                             conn.commit()
 
@@ -1109,40 +1138,15 @@ class MainWindow(QMainWindow):
         header_layout.addStretch()
         
         # Right Cluster: Management & Settings
-        self.btn_people = QPushButton("👥 People")
-        self.btn_people.setObjectName("flat")
-        self.btn_people.setFixedWidth(100)
-        self.btn_people.setToolTip("人物リストの管理と名前の変更を行います。")
-        self.btn_people.clicked.connect(self.show_person_manager)
-        header_layout.addWidget(self.btn_people)
+        self.btn_faces = QPushButton("👤 顔・人物")
+        self.btn_faces.setObjectName("flat")
+        self.btn_faces.setFixedWidth(120)
+        self.btn_faces.setCheckable(True)
+        self.btn_faces.setToolTip("顔写真の管理と整理画面を切り替えます。")
+        self.btn_faces.clicked.connect(self.toggle_face_manager)
+        header_layout.addWidget(self.btn_faces)
 
-        self.btn_face_organizer = QPushButton("👤 Organizer")
-        self.btn_face_organizer.setObjectName("flat")
-        self.btn_face_organizer.setFixedWidth(110)
-        self.btn_face_organizer.setToolTip("顔写真の整理と人物への割り当てを行います。")
-        self.btn_face_organizer.clicked.connect(self.show_face_organizer)
-        header_layout.addWidget(self.btn_face_organizer)
-
-        # Notification Badge
-        self.btn_notif = QPushButton("💡 0")
-        self.btn_notif.setObjectName("flat")
-        self.btn_notif.setFixedWidth(80)
-        self.btn_notif.setVisible(False)
-        self.btn_notif.setToolTip("同一人物の可能性があるペアが見つかりました。確認するにはクリックしてください。")
-        self.btn_notif.setStyleSheet("""
-            QPushButton { 
-                color: #FFD600; 
-                font-weight: bold; 
-                border: 1px solid #FFD600; 
-                border-radius: 4px; 
-                padding: 2px 5px;
-            }
-            QPushButton:hover {
-                background-color: rgba(255, 214, 0, 0.1);
-            }
-        """)
-        self.btn_notif.clicked.connect(self.show_face_verification)
-        header_layout.addWidget(self.btn_notif)
+        header_layout.addStretch()
 
         self.btn_settings = QPushButton("⚙️")
         self.btn_settings.setObjectName("flat")
@@ -1153,15 +1157,19 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(header)
 
-        # Body - Splitter
-        splitter = QSplitter(Qt.Horizontal)
+        # Body - Stacked Widget for View Switching
+        from PySide6.QtWidgets import QStackedWidget
+        self.central_stack = QStackedWidget()
+        
+        # View 0: Library View (Tree + Grid)
+        self.library_view = QSplitter(Qt.Horizontal)
         
         # Left: Tree
         self.tree_view = MediaTreeView()
         self.tree_view.loadRequest.connect(self.on_tree_load_request)
         self.tree_view.clicked.connect(self.on_tree_selection)
         self.tree_view.renameRequested.connect(self.on_rename_person)
-        splitter.addWidget(self.tree_view)
+        self.library_view.addWidget(self.tree_view)
         # Right side: Grid Area with Sub-Header
         grid_container = QWidget()
         grid_layout = QVBoxLayout(grid_container)
@@ -1242,9 +1250,17 @@ class MainWindow(QMainWindow):
         grid_layout.addWidget(self.grid_view)
 
 
-        splitter.addWidget(grid_container)
-        splitter.setStretchFactor(1, 4)
-        main_layout.addWidget(splitter)
+        self.library_view.addWidget(grid_container)
+        self.library_view.setStretchFactor(1, 4)
+        
+        self.central_stack.addWidget(self.library_view)
+        
+        # View 1: Face Manager View
+        self.face_manager_view = FaceManagerView(self.db)
+        self.face_manager_view.refresh_requested.connect(self.initialize_tree)
+        self.central_stack.addWidget(self.face_manager_view)
+        
+        main_layout.addWidget(self.central_stack)
 
         # Footer - Status Bar Initialization
         self.status_bar = QStatusBar()
@@ -1292,7 +1308,7 @@ class MainWindow(QMainWindow):
         if success:
             self.initialize_tree()
             self.show_images_paged()
-            self.update_verification_badge()
+            self.face_manager_view.refresh_sidebar()
             self.status_label.setText(f"Sync complete. Ready.")
         else:
             QMessageBox.critical(self, "Sync Error", f"Failed to sync folder: {message}")
@@ -1311,8 +1327,7 @@ class MainWindow(QMainWindow):
         self.act_face_clustering.setEnabled(enabled)
 
         # Management Controls
-        self.btn_people.setEnabled(enabled)
-        self.btn_face_organizer.setEnabled(enabled)
+        self.btn_faces.setEnabled(enabled)
         self.btn_settings.setEnabled(enabled)
         
         # Sub-Header Contextual Controls
@@ -1556,33 +1571,6 @@ class MainWindow(QMainWindow):
         
         self.load_next_page()
 
-    def update_verification_badge(self):
-        """Checks DB for suggested merges and updates the UI badge."""
-        try:
-            # We use local thresholds which can be updated later from settings
-            self.pending_merges = self.db.get_suggested_face_merges(
-                suggestion_thresh=self.face_suggestion_thresh,
-                auto_merge_thresh=self.face_auto_merge_thresh
-            )
-            count = len(self.pending_merges)
-            if count > 0:
-                self.btn_notif.setText(f"💡 {count}")
-                self.btn_notif.setVisible(True)
-            else:
-                self.btn_notif.setVisible(False)
-        except Exception as e:
-            logger.error(f"Failed to update verification badge: {e}")
-
-    def show_face_verification(self):
-        if not self.pending_merges:
-            return
-            
-        dlg = FaceVerificationDialog(self.db, self.pending_merges, self)
-        if dlg.exec():
-            # Refresh tree and grid if merges happened
-            self.initialize_tree()
-            self.on_tree_selection(self.tree_view.currentIndex())
-            self.update_verification_badge()
 
     def load_next_page(self):
         # Prevent parallel loading
@@ -1803,9 +1791,6 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(False)
         self.set_buttons_enabled(True)
         
-        # Update face verification suggestions
-        self.update_verification_badge()
-        
         # Capture current selection cluster_id to restore view context
         selected_cid = None
         selected_indexes = self.tree_view.selectedIndexes()
@@ -1880,37 +1865,19 @@ class MainWindow(QMainWindow):
         dialog.face_data_reset_requested.connect(self.run_face_data_reset)
         dialog.exec()
 
-    def show_person_manager(self):
-        # Immediate feedback
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        self.btn_people.setEnabled(False)
-        
-        try:
-            dialog = PersonManagerDialog(self.db, self)
-            QApplication.restoreOverrideCursor() # Cursor back to normal since dialog is non-blocking internally now
-            
-            if dialog.exec():
-                self.initialize_tree() # Refresh naming in the sidebar
-        finally:
-            QApplication.restoreOverrideCursor()
-            self.btn_people.setEnabled(True)
-
-    def show_face_organizer(self):
-        # Immediate feedback
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        self.btn_face_organizer.setEnabled(False)
-        
-        try:
-            from ui.dialogs.face_organizer_dialog import FaceOrganizerDialog
-            dialog = FaceOrganizerDialog(self.db, self)
-            QApplication.restoreOverrideCursor()
-            
-            if dialog.exec():
-                self.initialize_tree()
-                self.show_images_paged()
-        finally:
-            QApplication.restoreOverrideCursor()
-            self.btn_face_organizer.setEnabled(True)
+    def toggle_face_manager(self, checked):
+        """Switches between Library View and Face Manager View."""
+        if checked:
+            self.central_stack.setCurrentIndex(1)
+            self.btn_faces.setText("🖼️ ライブラリ")
+            self.btn_faces.setStyleSheet("background-color: #3D5AFE; color: white;")
+            self.face_manager_view.refresh_sidebar()
+        else:
+            self.central_stack.setCurrentIndex(0)
+            self.btn_faces.setText("👤 顔・人物")
+            self.btn_faces.setStyleSheet("")
+            self.show_images_paged()
+            self.initialize_tree()
 
 
 
@@ -1988,7 +1955,6 @@ class MainWindow(QMainWindow):
         if success:
             # 1. Clear internal caches for faces/clusters
             self.pending_merges = []
-            self.update_verification_badge()
             
             # 2. Refresh the person/category tree (Sidebar)
             self.initialize_tree()
@@ -1996,11 +1962,9 @@ class MainWindow(QMainWindow):
             # 3. Refresh the current view (Grid & Badges)
             self.show_images_paged()
             
-            # 4. If PersonManagerDialog is currently open, trigger its refresh logic
-            # Search for any active PersonManagerDialog instances
-            for widget in QApplication.topLevelWidgets():
-                if isinstance(widget, PersonManagerDialog) and widget.isVisible():
-                    widget.start_loading()
+            # 4. Refresh the face manager view if active
+            if self.central_stack.currentIndex() == 1:
+                self.face_manager_view.refresh_sidebar()
             
             QMessageBox.information(self, "Reset Complete", message)
         else:
@@ -2228,21 +2192,58 @@ class MainWindow(QMainWindow):
 
 
     def add_person_to_file(self, file_path, cluster_id):
+        """Triggers the asynchronous person association/registration process."""
+        action_type = None
+        params = {"file_path": file_path}
+
         if cluster_id is None:
+            # New Person registration
             from PySide6.QtWidgets import QInputDialog
-            name, ok = QInputDialog.getText(self, "New Person", "Enter Name:")
-            if ok and name:
-                # Create a new cluster
-                # We need a new unique cluster_id. Database.upsert_cluster with None id?
-                # Actually, our clusters table has auto-increment ID if we don't provide it.
-                # But Database.upsert_cluster expects one. Let's fix that or use a temporary approach.
-                new_id = self.db.create_cluster_manual(name)
-                cluster_id = new_id
+            name, ok = QInputDialog.getText(self, "New Person", "Enter Name for the Person found in this photo:")
+            if ok and name.strip():
+                action_type = PersonAction.REGISTER_NEW
+                params["name"] = name.strip()
             else:
                 return
+        else:
+            # Association with existing person
+            action_type = PersonAction.ASSOCIATE_EXISTING
+            params["cluster_id"] = cluster_id
 
-        self.db.add_face_manual(file_path, cluster_id)
+        # In a real app, we need the specific face_id. 
+        # Since this UI (context menu on file) doesn't know which face the user implies,
+        # we pick the first one or prompt. For Milestone 3 completeness, 
+        # we'll associate THE FIRST face found in that file if not specified.
+        faces = self.db.get_faces_for_file(file_path)
+        if not faces:
+            QMessageBox.warning(self, "No Faces", "No faces were detected in this photo yet. Please run Face Analysis first.")
+            return
+        
+        params["face_id"] = faces[0][0] # face_id of the first face
+
+        # Start background worker
+        self.person_worker = PersonManagementWorker(self.db, action_type, params)
+        self.person_worker.task_finished.connect(self.on_person_action_finished)
+        self.person_worker.refresh_requested.connect(self.on_person_refresh_requested)
+        self.person_worker.start()
+        
+        self.status_label.setText("Updating person association...")
+
+    @Slot(bool, str)
+    def on_person_action_finished(self, success, message):
+        if not success:
+            QMessageBox.critical(self, "Person Management Error", f"Operation failed: {message}")
+        self.status_label.setText(message)
+
+    @Slot()
+    def on_person_refresh_requested(self):
+        """Refreshes sidebar counts and current grid view after data modification."""
+        self.initialize_tree()
+        # Full refresh of current grid
         self.show_images_paged()
+        # Also notify Face Manager if it exists
+        if hasattr(self, 'face_manager_view'):
+            self.face_manager_view.refresh_sidebar()
 
     def delete_single_file(self, file_path):
         confirm = QMessageBox.question(self, "Delete File", "Move this file to .trash folder?",

@@ -1,4 +1,6 @@
 import os
+import ctypes
+from ctypes import wintypes
 
 
 def get_app_data_dir():
@@ -13,6 +15,13 @@ def get_app_data_dir():
     if not os.path.exists(app_dir):
         os.makedirs(app_dir, exist_ok=True)
     return app_dir
+
+def get_face_cache_dir():
+    app_dir = get_app_data_dir()
+    cache_dir = os.path.join(app_dir, ".face_cache")
+    if not os.path.exists(cache_dir):
+        os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir
 
 def fix_dll_search_path():
     """
@@ -37,4 +46,37 @@ def fix_dll_search_path():
             
         # 3. Add current directory to PATH as fallback for older libraries
         os.environ["PATH"] = env_bin + os.pathsep + os.environ.get("PATH", "")
+
+
+def get_short_path_name(long_name):
+    """
+    Returns the 8.3 short path name for a given long path.
+    This is a workaround for old C++ libraries (like OpenCV VideoCapture)
+    that do not support Unicode paths on Windows.
+    """
+    if os.name != 'nt':
+        return long_name
+        
+    try:
+        # Check if URL or something else that isn't a file
+        if not os.path.exists(long_name):
+            return long_name
+            
+        _GetShortPathNameW = ctypes.windll.kernel32.GetShortPathNameW
+        _GetShortPathNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        _GetShortPathNameW.restype = wintypes.DWORD
+
+        output_buf_size = 256
+        while True:
+            output_buf = ctypes.create_unicode_buffer(output_buf_size)
+            needed = _GetShortPathNameW(long_name, output_buf, output_buf_size)
+            if needed == 0:
+                # Error (e.g. short names disabled on volume)
+                return long_name
+            if output_buf_size >= needed:
+                return output_buf.value
+            else:
+                output_buf_size = needed
+    except:
+        return long_name
 

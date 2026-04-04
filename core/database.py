@@ -3,6 +3,7 @@ import json
 import os
 import logging
 import numpy as np
+import time
 from .utils import get_app_data_dir
 
 logger = logging.getLogger("PhotoArrange")
@@ -94,6 +95,20 @@ class Database:
                     frame_index INTEGER DEFAULT 0
                 )
             ''')
+            # Lightweight migration for faces: Add is_ignored if missing
+            cursor = conn.execute("PRAGMA table_info(faces)")
+            face_cols = [c[1] for c in cursor.fetchall()]
+            if 'is_ignored' not in face_cols:
+                try:
+                    conn.execute("ALTER TABLE faces ADD COLUMN is_ignored INTEGER DEFAULT 0")
+                    logger.info("Added is_ignored column to faces table.")
+                except Exception as e:
+                    logger.warning(f"Failed to add is_ignored column to faces: {e}")
+            # Milestone Performance: Critical Indexes for Face Management
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_faces_file_path ON faces(file_path)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_faces_cluster_id ON faces(cluster_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_faces_is_ignored ON faces(is_ignored)")
+            
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS clusters (
                     cluster_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -101,6 +116,16 @@ class Database:
                     is_ignored INTEGER DEFAULT 0
                 )
             ''')
+            # Lightweight migration for clusters: Add is_ignored if missing
+            cursor = conn.execute("PRAGMA table_info(clusters)")
+            cluster_cols = [c[1] for c in cursor.fetchall()]
+            if 'is_ignored' not in cluster_cols:
+                try:
+                    conn.execute("ALTER TABLE clusters ADD COLUMN is_ignored INTEGER DEFAULT 0")
+                    logger.info("Added is_ignored column to clusters table.")
+                except Exception as e:
+                    logger.warning(f"Failed to add is_ignored column to clusters: {e}")
+
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS ignored_person_vectors (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -119,6 +144,13 @@ class Database:
             conn.execute('CREATE INDEX IF NOT EXISTS idx_media_modified ON media (last_modified)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_media_capture_date ON media (capture_date DESC)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_faces_filepath ON faces (file_path COLLATE NOCASE)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_faces_cluster_ignored ON faces (cluster_id, is_ignored)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_faces_is_ignored ON faces (is_ignored)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_clusters_ignored ON clusters (is_ignored)')
+            
+            # Partial Indexes for optimized Face Manager categories
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_faces_unknown_partial ON faces (file_path) WHERE (cluster_id IS NULL OR cluster_id = -1) AND is_ignored = 0')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_faces_ignored_partial ON faces (file_path) WHERE is_ignored = 1')
             
             conn.execute('PRAGMA user_version = 32')
             
@@ -374,6 +406,10 @@ class Database:
             # Sort by name (if exists) then by id
             results.sort(key=lambda x: (str(x[1]) if x[1] else "", x[0] if x[0] is not None else -1))
             return results
+
+    def get_all_clusters(self):
+        """Alias for get_clusters(include_ignored=False) used by UI components."""
+        return self.get_clusters(include_ignored=False)
     def get_faces_for_cluster(self, cluster_id):
         with self.get_connection() as conn:
             query = 'SELECT face_id, file_path, bbox_json FROM faces WHERE cluster_id = ?'
@@ -388,7 +424,7 @@ class Database:
 
     def get_faces_with_meta_unclassified(self):
         with self.get_connection() as conn:
-            query = 'SELECT f.face_id, f.file_path, f.bbox_json, m.metadata_json, f.frame_index FROM faces f JOIN media m ON f.file_path = m.file_path WHERE f.cluster_id IS NULL OR f.cluster_id = -1'
+            query = 'SELECT f.face_id, f.file_path, f.bbox_json, m.metadata_json, f.frame_index FROM faces f JOIN media m ON f.file_path = m.file_path WHERE (f.cluster_id IS NULL OR f.cluster_id = -1) AND f.is_ignored = 0'
             cursor = conn.execute(query)
             return [{"face_id": r[0], "file_path": r[1], "bbox": json.loads(r[2]) if r[2] else None, "meta": json.loads(r[3]) if r[3] else {}, "frame_index": r[4]} for r in cursor.fetchall()]
 
@@ -402,6 +438,174 @@ class Database:
         with self.get_connection() as conn:
             conn.execute('INSERT INTO faces (file_path, cluster_id, bbox_json) VALUES (?, ?, ?)', (norm_path, cluster_id, '[]'))
             conn.commit()
+
+    def get_faces_by_category(self, category: str, person_id: int = None, limit: int = None, 
+                              after_date: str = None, after_id: int = None, specific_date: str = None):
+        """
+        Fetches faces categorized by 'person', 'unknown', or 'ignored'.
+        'person' category requires person_id (cluster_id).
+        Uses Keyset Pagination (after_date, after_id) for O(log N) performance on large datasets.
+        Optional: specific_date (YYYY-MM-DD) to filter results to a single day.
+        """
+        with self.get_connection() as conn:
+            # Using LEFT JOIN ensures that faces with missing or corrupted media entries 
+            # still appear in the UI (as orphaned/unknown date items) instead of being hidden.
+            query = """
+                SELECT f.face_id, f.file_path, f.bbox_json, f.cluster_id, f.is_ignored, m.capture_date, f.frame_index
+                FROM faces f
+                LEFT JOIN media m ON f.file_path = m.file_path
+            """
+            params = []
+            
+            if category == 'person' or (category == 'unknown' and person_id is not None and person_id > 0):
+                # Handle cases where person_id is actually provided for unknown (edge cases)
+                query += " WHERE f.cluster_id = ? AND f.is_ignored = 0"
+                params.append(person_id)
+            elif category == 'unknown':
+                query += " WHERE (f.cluster_id IS NULL OR f.cluster_id = -1) AND f.is_ignored = 0"
+            elif category == 'ignored':
+                query += " WHERE f.is_ignored = 1"
+            else:
+                query += " WHERE 1=1"
+            
+            # Filter by specific date if requested (Prefix match YYYY:MM:DD or YYYY-MM-DD or YYYY/MM/DD)
+            if specific_date:
+                # Normalizing date format for SQL comparison
+                norm_date = specific_date.replace("/", ":").replace("-", ":")
+                query += " AND m.capture_date LIKE ?"
+                params.append(f"{norm_date}%")
+
+            # Keyset Pagination: filter items AFTER the last seen (capture_date, face_id)
+            if after_date is not None and after_id is not None:
+                query += " AND (COALESCE(m.capture_date, '') < ? OR (COALESCE(m.capture_date, '') = ? AND f.face_id < ?))"
+                params.extend([after_date, after_date, after_id])
+            
+            query += " ORDER BY m.capture_date DESC, f.face_id DESC"
+            if limit is not None:
+                query += " LIMIT ?"
+                params.append(limit)
+            
+            start_time = time.perf_counter()
+            cursor = conn.execute(query, params)
+            rows = cursor.fetchall()
+            duration = time.perf_counter() - start_time
+            
+            results = [
+                {
+                    "face_id": r[0],
+                    "file_path": r[1],
+                    "bbox": json.loads(r[2]) if r[2] else None,
+                    "cluster_id": r[3],
+                    "is_ignored": bool(r[4]),
+                    "capture_date": r[5],
+                    "frame_index": r[6]
+                } for r in rows
+            ]
+            
+            logger.info(f"DB Query: get_faces_by_category({category}, limit={limit}, after={after_date}/{after_id}) "
+                        f"took {duration:.4f}s for {len(results)} records.")
+            return results
+
+    def get_face_dates_by_category(self, category: str, person_id: int = None):
+        """
+        Returns a list of (date_str, count) for the specified category or person.
+        Used for the hierarchical sidebar tree.
+        """
+        with self.get_connection() as conn:
+            query = """
+                SELECT SUBSTR(COALESCE(m.capture_date, '日付不明'), 1, 10) as date_key, COUNT(f.face_id)
+                FROM faces f
+                LEFT JOIN media m ON f.file_path = m.file_path
+            """
+            params = []
+            
+            if category == 'person':
+                query += " WHERE f.cluster_id = ? AND f.is_ignored = 0"
+                params.append(person_id)
+            elif category == 'unknown':
+                query += " WHERE (f.cluster_id IS NULL OR f.cluster_id = -1) AND f.is_ignored = 0"
+            elif category == 'ignored':
+                query += " WHERE f.is_ignored = 1"
+            
+            query += " GROUP BY date_key ORDER BY date_key DESC"
+            
+            cursor = conn.execute(query, params)
+            # Normalize date marks for UI consistency
+            return [(r[0].replace(":", "/"), r[1]) for r in cursor.fetchall()]
+
+    def get_face_counts(self) -> dict:
+        """
+        Returns total counts for 'unknown', 'ignored' categories, 
+        and per-person (cluster_id) counts.
+        Optimized via separate queries to ensure partial index hits.
+        """
+        with self.get_connection() as conn:
+            start_time = time.perf_counter()
+            
+            # Optimized lookup for unknown/ignored categories
+            unknown_row = conn.execute("SELECT COUNT(*) FROM faces WHERE (cluster_id IS NULL OR cluster_id = -1) AND is_ignored = 0").fetchone()
+            unknown_count = unknown_row[0] if unknown_row else 0
+            
+            ignored_row = conn.execute("SELECT COUNT(*) FROM faces WHERE is_ignored = 1").fetchone()
+            ignored_count = ignored_row[0] if ignored_row else 0
+            
+            total_row = conn.execute("SELECT COUNT(*) FROM faces WHERE is_ignored = 0").fetchone()
+            total_non_ignored = total_row[0] if total_row else 0
+            
+            # Counts grouped by person (cluster)
+            cursor = conn.execute("""
+                SELECT cluster_id, COUNT(*) 
+                FROM faces 
+                WHERE cluster_id IS NOT NULL AND cluster_id != -1 AND is_ignored = 0
+                GROUP BY cluster_id
+            """)
+            person_counts = {row[0]: row[1] for row in cursor.fetchall()}
+            
+            duration = time.perf_counter() - start_time
+            logger.info(f"DB Query: get_face_counts took {duration:.4f}s")
+            
+            return {
+                "unknown": unknown_count or 0,
+                "ignored": ignored_count or 0,
+                "total_persons": total_non_ignored or 0, 
+                "persons": person_counts
+            }
+
+    def update_face_association(self, face_id: int, person_id: int, is_ignored: bool = False):
+        """
+        Updates the association of a face with a person or marks it as ignored.
+        """
+        with self.get_connection() as conn:
+            conn.execute("""
+                UPDATE faces 
+                SET cluster_id = ?, is_ignored = ? 
+                WHERE face_id = ?
+            """, (person_id, 1 if is_ignored else 0, face_id))
+            conn.commit()
+
+    def set_cluster_ignored(self, cluster_id: int, is_ignored: bool = True):
+        """Sets the ignore flag for a whole cluster and its associated faces."""
+        val = 1 if is_ignored else 0
+        with self.get_connection() as conn:
+            # 1. Update cluster table
+            conn.execute("UPDATE clusters SET is_ignored = ? WHERE cluster_id = ?", (val, cluster_id))
+            # 2. Update all associated faces
+            conn.execute("UPDATE faces SET is_ignored = ? WHERE cluster_id = ?", (val, cluster_id))
+            conn.commit()
+
+    def get_person_list_with_counts(self):
+        """Returns a list of (cluster_id, name, count) for all non-ignored persons."""
+        with self.get_connection() as conn:
+            query = """
+                SELECT c.cluster_id, c.custom_name, COUNT(f.face_id) as face_count
+                FROM clusters c
+                LEFT JOIN faces f ON c.cluster_id = f.cluster_id
+                WHERE c.is_ignored = 0 AND (f.is_ignored = 0 OR f.is_ignored IS NULL)
+                GROUP BY c.cluster_id
+                ORDER BY c.custom_name ASC, c.cluster_id ASC
+            """
+            cursor = conn.execute(query)
+            return cursor.fetchall()
 
     def upsert_cluster(self, cluster_id, name, is_ignored=None):
         with self.get_connection() as conn:
@@ -849,7 +1053,7 @@ class Database:
         with self.get_connection() as conn:
             conn.execute('DELETE FROM clusters')
             conn.execute('DELETE FROM ignored_person_vectors')
-            conn.execute('UPDATE faces SET cluster_id = NULL')
+            conn.execute('UPDATE faces SET cluster_id = NULL, is_ignored = 0')
             conn.commit()
 
     def ignore_cluster(self, cluster_id):
@@ -946,4 +1150,3 @@ class Database:
         with self.get_connection() as conn:
             conn.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', (key, str(value)))
             conn.commit()
-

@@ -16,7 +16,7 @@ try:
 except ImportError:
     HAS_TORCH = False
 
-from core.utils import get_app_data_dir, fix_dll_search_path
+from core.utils import get_app_data_dir, fix_dll_search_path, get_short_path_name
 fix_dll_search_path() # Required for cv2 videoio FFmpeg DLLs on Windows
 
 
@@ -104,7 +104,9 @@ class ImageProcessor:
         
         # Extract dimensions using cv2
         try:
-            cap = cv2.VideoCapture(video_path)
+            # Use short path name to avoid OpenCV VideoCapture Unicode limitations on Windows
+            short_path = get_short_path_name(video_path)
+            cap = cv2.VideoCapture(short_path)
             meta["width"] = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             meta["height"] = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             cap.release()
@@ -207,8 +209,10 @@ class ImageProcessor:
             return target_path
             
         try:
-            if file_path.lower().endswith(('.mp4', '.avi', '.mov')):
-                cap = cv2.VideoCapture(file_path)
+            if file_path.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
+                # Use short path name for VideoCapture on Windows
+                short_path = get_short_path_name(file_path)
+                cap = cv2.VideoCapture(short_path)
                 if not cap.isOpened():
                     return None
                 
@@ -243,8 +247,12 @@ class ImageProcessor:
         """
         frames_with_indices = []
         try:
-            cap = cv2.VideoCapture(video_path)
+            # Use short path name for VideoCapture on Windows
+            short_path = get_short_path_name(video_path)
+            cap = cv2.VideoCapture(short_path)
             if not cap.isOpened():
+                import logging
+                logging.getLogger("PhotoArrange").error(f"Could not open video with VideoCapture: {video_path}")
                 return []
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             if total_frames <= 0:
