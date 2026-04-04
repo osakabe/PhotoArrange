@@ -4,7 +4,7 @@ import logging
 import cv2
 import numpy as np
 import time
-from PIL import Image
+from PIL import Image, ImageOps
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem, 
     QListView, QStyledItemDelegate, QPushButton, QMenu, QMessageBox, 
@@ -274,13 +274,22 @@ class FaceCropWorker(QThread):
                             buf = np.frombuffer(f.read(), dtype=np.uint8)
                             source_img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
             else:
-                # IMAGES: Robust Windows Path Loading (Unicode support)
+                # IMAGES: Standardize orientation with AI detection (v2.1 Fix)
                 try:
-                    with open(file_path, 'rb') as f:
-                        buf = np.frombuffer(f.read(), dtype=np.uint8)
-                        source_img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+                    # Using PIL for EXIF-aware loading (Matches FaceProcessor)
+                    with Image.open(file_path) as img_pil:
+                        img_pil = ImageOps.exif_transpose(img_pil)
+                        img_pil = img_pil.convert('RGB')
+                        source_img = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
                 except Exception as e:
-                    logger.error(f"FaceCropWorker: Decode error for {file_path}: {e}")
+                    logger.error(f"FaceCropWorker: PIL orientation error for {file_path}: {e}")
+                    # Fallback to raw OpenCV if PIL fails
+                    try:
+                        with open(file_path, 'rb') as f:
+                            buf = np.frombuffer(f.read(), dtype=np.uint8)
+                            source_img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+                    except:
+                        pass
 
             if source_img is None:
                 logger.error(f"FaceCropWorker: Source image is None for {file_path}")
@@ -446,6 +455,11 @@ class FaceModel(QAbstractListModel):
         if row >= len(self._data): return None
         
         if role == Qt.UserRole:
+            return self._data[row]
+        return None
+
+    def get_item(self, row):
+        if 0 <= row < len(self._data):
             return self._data[row]
         return None
 
@@ -711,6 +725,7 @@ class FaceManagerView(QWidget):
         self.all_loaded = False
         self.last_date_key = None
         self.active_workers = [] # Engine Connectivity (v2.2 Overhaul)
+        self.cache_dir = get_face_cache_dir()
         self.init_ui()
         
         self.render_engine = FaceCropManager.get_instance(self.db)
@@ -1326,7 +1341,39 @@ class FaceManagerView(QWidget):
             
         a2 = menu.addAction(f"🚫 無視リストへ")
         a2.triggered.connect(lambda: self._bulk_ignore_with_ids(ids))
+        
+        menu.addSeparator()
+        a3 = menu.addAction(f"🖼️ キャッシュ再描画 ({count}枚)")
+        a3.triggered.connect(lambda: self._rerender_with_ids(ids))
+        
         menu.exec(pos)
+
+    def _rerender_with_ids(self, ids):
+        """Physically deletes the current cache and enqueues for immediate re-rendering."""
+        items_to_fix = []
+        for i in range(self.face_model.rowCount()):
+            item = self.face_model.get_item(i)
+            if item and not item.get("is_header") and item.get("face_id") in ids:
+                # 1. Reset Model State
+                item["qimage"] = None
+                item["needs_crop"] = True
+                item["failed"] = False
+                
+                # 2. Inform Model of Change
+                idx = self.face_model.index(i, 0)
+                self.face_model.dataChanged.emit(idx, idx, [Qt.UserRole, Qt.DecorationRole])
+                
+                # 3. Physically delete the file to be safe
+                path = os.path.join(self.cache_dir, f"face_{item['face_id']}.jpg")
+                if os.path.exists(path):
+                    try: os.remove(path)
+                    except: pass
+                
+                items_to_fix.append(item)
+        
+        if items_to_fix:
+            logger.info(f"Rerendering {len(items_to_fix)} faces manually.")
+            self._start_crop_worker(items_to_fix)
 
     def _bulk_register_new_with_ids(self, ids):
         from PySide6.QtWidgets import QInputDialog
