@@ -1,5 +1,6 @@
-import sqlite3
 import os
+import sqlite3
+
 
 def check_db():
     db_path = "photo_app.db"
@@ -11,14 +12,16 @@ def check_db():
     cursor = conn.cursor()
 
     print("--- Database Content Audit ---")
-    
+
     # 1. Total faces
     cursor.execute("SELECT COUNT(*) FROM faces")
     total_faces = cursor.fetchone()[0]
     print(f"Total faces: {total_faces}")
 
     # 2. Unknown faces
-    cursor.execute("SELECT COUNT(*) FROM faces WHERE (cluster_id IS NULL OR cluster_id = -1) AND is_ignored = 0")
+    cursor.execute(
+        "SELECT COUNT(*) FROM faces WHERE (cluster_id IS NULL OR cluster_id = -1) AND is_ignored = 0"
+    )
     unknown_faces = cursor.fetchone()[0]
     print(f"Unknown faces (not ignored): {unknown_faces}")
 
@@ -37,14 +40,19 @@ def check_db():
         print(f"  - Cluster {cid}: {name or 'N/A'} | Ignored: {ignored} | Faces: {cnt}")
 
     # 5. Check if any faces have invalid cluster_ids
-    cursor.execute("SELECT COUNT(*) FROM faces WHERE cluster_id NOT IN (SELECT cluster_id FROM clusters) AND cluster_id IS NOT NULL AND cluster_id != -1")
+    cursor.execute(
+        "SELECT COUNT(*) FROM faces WHERE cluster_id NOT IN (SELECT cluster_id FROM clusters) AND cluster_id IS NOT NULL AND cluster_id != -1"
+    )
     orphaned_faces = cursor.fetchone()[0]
     if orphaned_faces > 0:
-        print(f"WARNING: Found {orphaned_faces} orphaned faces (cluster_id exists but not in clusters table).")
+        print(
+            f"WARNING: Found {orphaned_faces} orphaned faces (cluster_id exists but not in clusters table)."
+        )
     else:
         print("Data Integrity: No orphaned faces found.")
 
     conn.close()
+
 
 if __name__ == "__main__":
     check_db()

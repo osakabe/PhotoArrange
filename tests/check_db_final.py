@@ -1,5 +1,6 @@
-import sqlite3
 import os
+import sqlite3
+
 from core.utils import get_app_data_dir
 
 db_path = os.path.join(get_app_data_dir(), "media_cache.db")
@@ -23,6 +24,6 @@ for h, count in rows[:10]:
     for p in paths[:3]:
         print(f"  - {os.path.basename(p)}")
     if len(paths) > 3:
-        print(f"  ... (+{len(paths)-3} more)")
+        print(f"  ... (+{len(paths) - 3} more)")
 
 conn.close()

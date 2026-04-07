@@ -1,7 +1,7 @@
-import sqlite3
 import os
+import sqlite3
 
-db_path = 'photo_app.db'
+db_path = "photo_app.db"
 if not os.path.exists(db_path):
     print(f"Error: {db_path} not found.")
     exit(1)
@@ -22,6 +22,6 @@ for h, count in rows[:10]:
     for p in paths[:3]:
         print(f"  - {os.path.basename(p)}")
     if len(paths) > 3:
-        print(f"  ... (+{len(paths)-3} more)")
+        print(f"  ... (+{len(paths) - 3} more)")
 
 conn.close()

@@ -1,16 +1,16 @@
-import sqlite3
 import os
-import json
+import sqlite3
+
 
 def thorough_db_audit():
-    db_file = os.path.join(os.environ['LOCALAPPDATA'], 'PhotoArrange', 'media_cache.db')
+    db_file = os.path.join(os.environ["LOCALAPPDATA"], "PhotoArrange", "media_cache.db")
     if not os.path.exists(db_file):
         print("Error: Database not found.")
         return
 
     conn = sqlite3.connect(db_file)
     cursor = conn.cursor()
-    
+
     print(f"--- Thorough Audit: {db_file} ---")
 
     # 1. Check media table for any group_id
@@ -48,7 +48,9 @@ def thorough_db_audit():
         print(f"Sample ghost groups: {ghost_groups[:3]}")
 
     # 5. Discovery Method distribution
-    cursor.execute("SELECT discovery_method, count(*) FROM duplicate_groups GROUP BY discovery_method")
+    cursor.execute(
+        "SELECT discovery_method, count(*) FROM duplicate_groups GROUP BY discovery_method"
+    )
     print(f"Discovery methods distribution: {cursor.fetchall()}")
 
     # 6. Check for NULL/Empty group_ids in duplicate_groups
@@ -57,6 +59,7 @@ def thorough_db_audit():
     print(f"Invalid (NULL/Empty) group_ids in duplicate_groups: {invalid_ids}")
 
     conn.close()
+
 
 if __name__ == "__main__":
     thorough_db_audit()

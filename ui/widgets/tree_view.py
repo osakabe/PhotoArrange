@@ -1,6 +1,16 @@
-from PySide6.QtWidgets import QTreeView, QMenu, QInputDialog
-from PySide6.QtGui import QStandardItemModel, QStandardItem, QAction
-from PySide6.QtCore import Qt, Signal
+import logging
+import threading
+import traceback
+from typing import Any, Optional
+
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QStandardItem, QStandardItemModel
+from PySide6.QtWidgets import QInputDialog, QMenu, QTreeView
+
+from core.utils import Profiler
+
+logger = logging.getLogger("PhotoArrange")
+
 
 class MediaTreeView(QTreeView):
     renameRequested = Signal(str, str)
@@ -12,10 +22,13 @@ class MediaTreeView(QTreeView):
         self.model.setHorizontalHeaderLabels(["Person/Period"])
         self.setModel(self.model)
         self.setHeaderHidden(False)
+
+        logger.info(f"Tree[{id(self)}]: Initialized. Thread: {threading.current_thread().name}")
+
         self.setEditTriggers(QTreeView.NoEditTriggers)
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
-        
+
         # Track expansion state
         self.expanded_keys = set()
         self._target_scroll_val = 0
@@ -41,11 +54,17 @@ class MediaTreeView(QTreeView):
 
     def show_context_menu(self, position):
         index = self.indexAt(position)
-        if not index.isValid(): return
+        if not index.isValid():
+            return
         item = self.model.itemFromIndex(index)
         if item.parent() is None:
             text = item.text()
-            if text not in ["All Photos", "🚫 No Faces Detected", "Duplicates", "☣️ Corrupted Media"]:
+            if text not in [
+                "All Photos",
+                "🚫 No Faces Detected",
+                "Duplicates",
+                "☣️ Corrupted Media",
+            ]:
                 menu = QMenu()
                 rename_action = QAction("Rename...", self)
                 rename_action.triggered.connect(lambda: self.request_rename(item))
@@ -53,44 +72,111 @@ class MediaTreeView(QTreeView):
                 menu.exec(self.viewport().mapToGlobal(position))
 
     def request_rename(self, item):
-        old_name = item.text()
-        new_name, ok = QInputDialog.getText(self, "Rename", f"New name for {old_name}:", text=old_name)
+        old_name = item.data(Qt.UserRole + 10) or item.text()
+        new_name, ok = QInputDialog.getText(
+            self, "Rename", f"New name for {old_name}:", text=old_name
+        )
         if ok and new_name and new_name != old_name:
             self.renameRequested.emit(old_name, new_name)
 
-    def initialize_categories(self, categories):
-        # Capture current scroll position
-        self._target_scroll_val = self.verticalScrollBar().value()
-        
-        self.model.clear()
-        self.model.setHorizontalHeaderLabels(["Person/Period"])
-        
-        # Re-add category nodes and restore their expansion state
-        self.add_category_node("All Photos", None)
-        self.add_category_node("🚫 No Faces Detected", -1)
-        self.add_category_node("Duplicates", -2)
-        self.add_category_node("☣️ Corrupted Media", -3)
+    def initialize_categories(self, categories: list[tuple], add_defaults: bool = True) -> None:
+        """
+        Initializes the tree with root categories with extreme logging.
+        """
+        try:
+            # 1. Thread Safety Check
+            is_main = threading.current_thread() is threading.main_thread()
+            logger.info(
+                f"Tree[{id(self)}]: initialize_categories ENTER. MainThread={is_main}, ItemCount={len(categories)}"
+            )
+            if not is_main:
+                logger.error(
+                    f"Tree[{id(self)}]: CRITICAL - initialize_categories called from WRONG THREAD: {threading.current_thread().name}"
+                )
 
-        for name, cluster_id in sorted(categories):
-            if cluster_id is not None and cluster_id >= 0:
-                self.add_category_node(name, cluster_id)
-        
-        self.restore_scroll()
+            # 2. Visibility Audit
+            win = self.window()
+            parent = self.parent()
+            logger.info(
+                f"Tree[{id(self)}]: Visibility Status - Self:{self.isVisible()}, Parent:{parent.isVisible() if parent else 'None'}, "
+                f"Window:{win.isVisible() if win else 'None'}, Geometry:{self.geometry()}"
+            )
 
-    def add_category_node(self, name, cluster_id):
-        item = QStandardItem(name)
-        item.setData(cluster_id, Qt.UserRole)
-        item.setData("category", Qt.UserRole + 2)
-        item.setData(False, Qt.UserRole + 3)
-        item.appendRow(QStandardItem("Loading..."))
-        self.model.appendRow(item)
-        
-        # Restore expansion if it was previously open
-        key = self.get_item_key(item)
-        if key in self.expanded_keys:
-            self.expand(item.index())
-            
-        return item
+            # Capture current scroll position
+            self._target_scroll_val = self.verticalScrollBar().value()
+
+            self.model.layoutAboutToBeChanged.emit()
+
+            # 3. Model Update
+            old_rows = self.model.rowCount()
+            self.model.removeRows(0, old_rows)
+            self.model.setHorizontalHeaderLabels(["Person/Period"])
+            logger.info(f"Tree[{id(self)}]: Model cleared (Old Rows: {old_rows}).")
+
+            if add_defaults:
+                self.add_category_node("All Photos", None)
+                self.add_category_node("🚫 No Faces Detected", -1)
+                self.add_category_node("Duplicates", -2)
+                self.add_category_node("☣️ Corrupted Media", -3)
+
+            for i, item_data in enumerate(categories):
+                try:
+                    if len(item_data) >= 3:
+                        name, cluster_id, count = item_data[:3]
+                        label = f"{name} ({count:,})" if count is not None else name
+                    elif len(item_data) == 2:
+                        name, cluster_id = item_data[:2]
+                        label = name
+                    else:
+                        logger.warning(
+                            f"Tree[{id(self)}]: Invalid category data at {i}: {item_data}"
+                        )
+                        continue
+                    self.add_category_node(label, cluster_id, name_only=name)
+                except Exception as e:
+                    logger.error(
+                        f"Tree[{id(self)}]: Failed to add node {item_data}: {e}\n{traceback.format_exc()}"
+                    )
+
+            self.model.layoutChanged.emit()
+
+            # 4. UI Force Refresh
+            self.show()
+            self.raise_()
+            self.viewport().update()
+            self.repaint()  # Synchronous repaint for diagnostics
+
+            # Use Timer for column resize to ensure it happens after layout
+            QTimer.singleShot(50, lambda: self.resizeColumnToContents(0))
+
+            logger.info(
+                f"Tree[{id(self)}]: initialize_categories COMPLETE. New Rows: {self.model.rowCount()}"
+            )
+
+        except Exception as e:
+            logger.error(
+                f"Tree[{id(self)}]: FATAL ERROR in initialize_categories: {e}\n{traceback.format_exc()}"
+            )
+
+    def add_category_node(
+        self, display_text: str, cluster_id: Optional[int], name_only: str = ""
+    ) -> QStandardItem:
+        try:
+            item = QStandardItem(display_text)
+            item.setData(cluster_id, Qt.UserRole)
+            item.setData(name_only or display_text, Qt.UserRole + 10)
+            item.setData("category", Qt.UserRole + 2)
+            item.setData(False, Qt.UserRole + 3)
+            item.appendRow(QStandardItem("Loading..."))
+            self.model.appendRow(item)
+
+            key = self.get_item_key(item)
+            if key and key in self.expanded_keys:
+                self.expand(item.index())
+            return item
+        except Exception as e:
+            logger.error(f"Tree[{id(self)}]: add_category_node error for '{display_text}': {e}")
+            return None
 
     def find_category_item(self, cluster_id):
         """Finds a top-level category item by its cluster_id."""
@@ -103,13 +189,15 @@ class MediaTreeView(QTreeView):
     def on_item_expanded(self, index):
         item = self.model.itemFromIndex(index)
         key = self.get_item_key(item)
-        if key: self.expanded_keys.add(key)
-        
-        if item.data(Qt.UserRole + 3): return # Already loaded
-        
+        if key:
+            self.expanded_keys.add(key)
+
+        if item.data(Qt.UserRole + 3):
+            return  # Already loaded
+
         if item.rowCount() > 0 and item.child(0).text() == "Loading...":
             item.removeRow(0)
-            
+
         itype = item.data(Qt.UserRole + 2)
         if itype == "category":
             cid = item.data(Qt.UserRole)
@@ -122,8 +210,10 @@ class MediaTreeView(QTreeView):
             data = item.data(Qt.UserRole + 1)
             if data and len(data) >= 3:
                 cid, year, month = data[:3]
-                self.loadRequest.emit(item, "locations", {"cluster_id": cid, "year": year, "month": month})
-        
+                self.loadRequest.emit(
+                    item, "locations", {"cluster_id": cid, "year": year, "month": month}
+                )
+
         item.setData(True, Qt.UserRole + 3)
 
     def on_item_collapsed(self, index):
@@ -132,39 +222,46 @@ class MediaTreeView(QTreeView):
         if key in self.expanded_keys:
             self.expanded_keys.remove(key)
 
-    def add_sub_items(self, parent_item, items, level):
-        for val in sorted(items, reverse=(level == "years")):
-            display_text = str(val) if level != "months" else f"{val}m"
-            sub_item = QStandardItem(display_text)
-            sub_item.setData(level, Qt.UserRole + 2)
-            sub_item.setData(False, Qt.UserRole + 3)
-            
-            if level == "years":
-                sub_item.setData(val, Qt.UserRole + 4)
-                sub_item.appendRow(QStandardItem("Loading..."))
-            elif level == "months":
-                p = parent_item.parent()
-                cid = p.data(Qt.UserRole) if p else parent_item.data(Qt.UserRole)
-                year = parent_item.data(Qt.UserRole + 4)
-                sub_item.setData((cid, year, val), Qt.UserRole + 1)
-                sub_item.appendRow(QStandardItem("Loading..."))
-            elif level == "locations":
-                # Location data
-                data = parent_item.data(Qt.UserRole + 1)
-                if data and len(data) >= 3:
-                    cid, year, month = data[:3]
-                    sub_item.setData((cid, year, month, val), Qt.UserRole + 1)
-                
-            parent_item.appendRow(sub_item)
-            
-            # Auto-re-expand if needed
-            key = self.get_item_key(sub_item)
-            if key and key in self.expanded_keys:
-                self.expand(sub_item.index())
-        
-        self.restore_scroll()
+    def add_sub_items(
+        self, parent_item: QStandardItem, items: list[tuple[Any, int]], level: str
+    ) -> None:
+        """
+        Adds sub-items (years, months, locations) with counts.
+        """
+        with Profiler(f"MediaTreeView.add_sub_items (level={level}, count={len(items)})"):
+            try:
+                for val, count in sorted(
+                    items, key=lambda x: str(x[0]), reverse=(level == "years")
+                ):
+                    display_text = f"{val} ({count:,})" if count is not None else str(val)
+                    sub_item = QStandardItem(display_text)
+                    sub_item.setData(level, Qt.UserRole + 2)
+                    sub_item.setData(False, Qt.UserRole + 3)
+                    sub_item.setData(val, Qt.UserRole + 11)
+
+                    if level == "years":
+                        sub_item.setData(val, Qt.UserRole + 4)
+                        sub_item.appendRow(QStandardItem("Loading..."))
+                    elif level == "months":
+                        p = parent_item.parent()
+                        cid = p.data(Qt.UserRole) if p else parent_item.data(Qt.UserRole)
+                        year = parent_item.data(Qt.UserRole + 4)
+                        sub_item.setData((cid, year, val), Qt.UserRole + 1)
+                        sub_item.appendRow(QStandardItem("Loading..."))
+                    elif level == "locations":
+                        data = parent_item.data(Qt.UserRole + 1)
+                        if data and len(data) >= 3:
+                            cid, year, month = data[:3]
+                            sub_item.setData((cid, year, month, val), Qt.UserRole + 1)
+
+                    parent_item.appendRow(sub_item)
+                    key = self.get_item_key(sub_item)
+                    if key and key in self.expanded_keys:
+                        self.expand(sub_item.index())
+                self.restore_scroll()
+            except Exception as e:
+                logger.error(f"Tree[{id(self)}]: add_sub_items error: {e}")
 
     def restore_scroll(self):
         """Attempts to restore the scroll position after a short delay to account for UI layout."""
-        from PySide6.QtCore import QTimer
         QTimer.singleShot(10, lambda: self.verticalScrollBar().setValue(self._target_scroll_val))

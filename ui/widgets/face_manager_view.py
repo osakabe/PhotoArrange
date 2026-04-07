@@ -1,1444 +1,738 @@
-import os
-import json
 import logging
-import cv2
-import numpy as np
-import time
-from PIL import Image, ImageOps
+import os
+from dataclasses import dataclass
+from typing import Any, Optional
+
+from PySide6.QtCore import QModelIndex, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtGui import QAction, QImage
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem, 
-    QListView, QStyledItemDelegate, QPushButton, QMenu, QMessageBox, 
-    QApplication, QSplitter, QSizePolicy, QProgressBar, QStyle, 
-    QTreeWidget, QTreeWidgetItem
-)
-from PySide6.QtCore import (
-    Qt, QSize, QThread, Signal, QRect, QPoint, Slot, QTimer, 
-    QAbstractListModel, QModelIndex, QEvent, QObject
-)
-from PySide6.QtGui import (
-    QPixmap, QImage, QAction, QColor, QPainter, QPen, QBrush, QFont
+    QComboBox,
+    QDialog,
+    QDoubleSpinBox,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QListWidget,
+    QMenu,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QSplitter,
+    QVBoxLayout,
+    QWidget,
 )
 
-from core.utils import get_face_cache_dir, get_short_path_name
-from processor.image_processor import ImageProcessor
-from processor.person_logic import PersonManagementWorker, PersonAction
+from core.database import Database
+from core.models import ClusterInfo, FaceCountsResult, FaceDisplayItem, FaceInfo
+from core.repositories.face_repository import FaceRepository
+from core.utils import Profiler, get_face_cache_dir
 from processor.suggestion_logic import FaceSuggestionWorker
+from processor.workers import (
+    FaceCropResult,
+    FaceCropWorker,
+    FaceLoadResult,
+    FaceLoadWorker,
+    PersonAction,
+    PersonManagementWorker,
+    PersonOptimizationWorker,
+    SidebarLoadWorker,
+)
+from ui.ui_utils import group_media_by_date_and_location
+
+from .thumbnail_grid import ThumbnailGrid
+from .tree_view import MediaTreeView
 
 logger = logging.getLogger("PhotoArrange")
 
-class FaceLoadWorker(QThread):
-    """
-    Worker thread to load faces from database and generate crops if missing.
-    Batches results to avoid UI thread saturation.
-    """
-    faces_loaded = Signal(int, list) # cid, list of (face_info, qimage)
-    has_more_available = Signal(bool)
-    finished = Signal()
 
-    def __init__(self, db, category_id, limit=200, after_date=None, after_id=None, specific_date=None):
-        super().__init__()
-        self.db = db
-        self.category_id = category_id # -1: Unknown, -2: Ignored, else: cluster_id
-        self.limit = limit
-        self.after_date = after_date
-        self.after_id = after_id
-        self.specific_date = specific_date
-        self.is_running = True
-        self.cache_dir = get_face_cache_dir()
+@dataclass
+class FaceUIItem:
+    info: FaceInfo
+    qimage: Optional[QImage] = None
+    selected: bool = False
+    needs_crop: bool = True
 
-    def stop(self):
-        self.is_running = False
 
-    def run(self):
-        worker_start = time.perf_counter()
-        logger.info(f"FaceLoadWorker(cat={self.category_id}, after={self.after_date}/{self.after_id}) starting...")
-        try:
-            faces = []
-            if self.category_id == -1: # Unknown
-                faces = self.db.get_faces_by_category('unknown', limit=self.limit, after_date=self.after_date, after_id=self.after_id, specific_date=self.specific_date)
-            elif self.category_id == -2: # Ignored
-                faces = self.db.get_faces_by_category('ignored', limit=self.limit, after_date=self.after_date, after_id=self.after_id, specific_date=self.specific_date)
-            else: # Specific Cluster
-                faces = self.db.get_faces_by_category('person', person_id=self.category_id, limit=self.limit, after_date=self.after_date, after_id=self.after_id, specific_date=self.specific_date)
-
-            fetch_duration = time.perf_counter() - worker_start
-            logger.info(f"DB Fetch took {fetch_duration:.4f}s for {len(faces)} faces.")
-
-            # Detect if there's possibly more data
-            has_more = len(faces) >= self.limit
-            self.has_more_available.emit(has_more)
-
-            batch = []
-            batch_size = 100 
-            batch_count = 0
-
-            for f in faces:
-                if not self.is_running: break
-                
-                # Check for cache existence (fast)
-                face_id = f["face_id"]
-                cache_path = os.path.join(self.cache_dir, f"face_{face_id}.jpg")
-                
-                qimg = None
-                exists = os.path.exists(cache_path)
-                
-                if exists:
-                    # We MUST check if it can actually be loaded as an image, not just file size (FACT-BASED FIX)
-                    qimg = QImage(cache_path)
-                    null = qimg.isNull()
-                    size = os.path.getsize(cache_path) if exists else 0
-                    logger.info(f"FACT_CHECK: FaceID={face_id} Path={cache_path} Exists={exists} Size={size} isNull={null}")
-                    
-                    if null:
-                        logger.warning(f"FaceLoadWorker: Cache corrupted for face_{face_id} (exists but unreadable). Forcing regeneration.")
-                        f["needs_crop"] = True
-                        qimg = None
-                    else:
-                        # Success: use existing cache
-                        pass
-                else:
-                    logger.info(f"FACT_CHECK: FaceID={face_id} MISSING at {cache_path}")
-                    f["needs_crop"] = True
-
-                batch.append((f, qimg))
-                
-                if len(batch) >= batch_size:
-                    batch_count += 1
-                    b_start = time.perf_counter()
-                    self.faces_loaded.emit(self.category_id, batch)
-                    batch_duration = time.perf_counter() - b_start
-                    logger.info(f"Batch {batch_count} emission took {batch_duration:.4f}s")
-                    batch = []
-                    self.msleep(5) 
-            
-            if batch and self.is_running:
-                self.faces_loaded.emit(self.category_id, batch)
-            
-            total_duration = time.perf_counter() - worker_start
-            logger.info(f"FaceLoadWorker(cat={self.category_id}) Total processing finished in {total_duration:.4f}s")
-            self.finished.emit()
-        except Exception as e:
-            logger.exception(f"FaceLoadWorker Error: {e}")
-            self.finished.emit()
-
-    def get_or_generate_crop(self, face_data):
-        """Generates a face crop from the original image/video frame."""
-        face_id = face_data["face_id"]
-        cache_path = os.path.join(self.cache_dir, f"face_{face_id}.jpg")
-        
-        file_path = face_data["file_path"]
-        bbox = face_data["bbox"]
-        frame_idx = face_data.get("frame_index", 0)
-        
-        if not bbox or not os.path.exists(file_path):
-            return None
-
-        try:
-            is_video = file_path.lower().endswith(('.mp4', '.avi', '.mov', '.mkv'))
-            if is_video:
-                short_path = get_short_path_name(file_path)
-                cap = cv2.VideoCapture(short_path)
-                if not cap.isOpened(): return None
-                cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
-                success, frame = cap.read()
-                cap.release()
-                if not success: return None
-                img_cv = frame
-            else:
-                try:
-                    with Image.open(file_path) as pil_img:
-                        from PIL import ImageOps
-                        pil_img = ImageOps.exif_transpose(pil_img)
-                        img_cv = cv2.cvtColor(np.array(pil_img.convert('RGB')), cv2.COLOR_RGB2BGR)
-                except:
-                    # Fallback to cv2 if PIL fails
-                    img_cv = cv2.imread(get_short_path_name(file_path))
-                    if img_cv is None: return None
-
-            ih, iw = img_cv.shape[:2]
-            x1, y1, x2, y2 = bbox
-            w, h = x2 - x1, y2 - y1
-            
-            # Pad the crop slightly (30%)
-            x1 = max(0, x1 - w * 0.3)
-            y1 = max(0, y1 - h * 0.3)
-            x2 = min(iw, x2 + w * 0.3)
-            y2 = min(ih, y2 + h * 0.3)
-            
-            crop = img_cv[int(y1):int(y2), int(x1):int(x2)]
-            if crop.size == 0: return None
-            
-            crop = cv2.resize(crop, (150, 150), interpolation=cv2.INTER_AREA)
-            success, buffer = cv2.imencode('.jpg', crop)
-            if success:
-                buffer.tofile(cache_path)
-                return cache_path
-            return None
-        except Exception as e:
-            logger.error(f"Failed to generate face crop for {face_id}: {e}")
-            return None
-
-class FaceCropWorker(QThread):
-    """Generates face crops on-demand for items missing images."""
-    images_ready = Signal(list) # list of (face_id, qimage)
-    image_failed = Signal(int)  # face_id
-    finished_batch = Signal()
-
-    def __init__(self, db, items, manager=None):
-        super().__init__()
-        self.db = db
-        self.items = items
-        self.manager = manager # Optional reference
-        self.cache_dir = get_face_cache_dir()
-        self.is_running = True
-        self.img_proc = ImageProcessor()
-
-    def stop(self):
-        self.is_running = False
-
-    def run(self):
-        worker_id = id(self)
-        start_ts = time.perf_counter()
-        logger.info(f"FaceCropWorker[{worker_id}] starting background task for {len(self.items)} items.")
-        
-        try:
-            batch_results = []
-            for item in self.items:
-                if not self.is_running: break
-                
-                face_id = item.get("face_id")
-                cache_path = os.path.join(self.cache_dir, f"face_{face_id}.jpg")
-                
-                # REGENERATION LOGIC (v2.3 Fix): Invalidate 0-byte or very small corrupted files
-                needs_regen = not os.path.exists(cache_path) or os.path.getsize(cache_path) < 1024
-                
-                if needs_regen:
-                    self._generate_single_crop(item, cache_path)
-                
-                if os.path.exists(cache_path):
-                    qimg = QImage(cache_path)
-                    if not qimg.isNull():
-                        batch_results.append((face_id, qimg))
-                    else:
-                        logger.error(f"FaceCropWorker: Cache file at {cache_path} is invalid.")
-                        self.image_failed.emit(face_id)
-                else:
-                    logger.error(f"FaceCropWorker: Failed to generate crop for {face_id}")
-                    self.image_failed.emit(face_id)
-                
-                # Batch emission every 20 items
-                if len(batch_results) >= 20:
-                    self.images_ready.emit(batch_results)
-                    batch_results = []
-                    self.msleep(5) # Yield
-            
-            # Final batch
-            if batch_results:
-                self.images_ready.emit(batch_results)
-            
-            duration = time.perf_counter() - start_ts
-            logger.info(f"FaceCropWorker[{worker_id}] finished in {duration:.4f}s for {len(self.items)} items")
-            self.finished_batch.emit()
-        except Exception as e:
-            logger.exception(f"FaceCropWorker Error: {e}")
-
-    def _generate_single_crop(self, face_data, cache_path):
-        try:
-            raw_path = face_data.get("file_path")
-            if not raw_path: return
-            file_path = os.path.normpath(os.path.normcase(raw_path))
-            
-            bbox = face_data.get("bbox")
-            if not bbox or not file_path: return
-            
-            source_img = None
-            is_video = file_path.lower().endswith(('.mp4', '.avi', '.mov', '.mkv'))
-            
-            if is_video:
-                # MANDATORY: Video extraction must use the EXACT frame_idx (v2.1 Fix)
-                frame_idx = face_data.get("frame_index", 0)
-                short_path = get_short_path_name(file_path)
-                cap = cv2.VideoCapture(short_path)
-                if cap.isOpened():
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
-                    ret, frame = cap.read()
-                    cap.release()
-                    if ret: 
-                        source_img = frame
-                
-                # FINAL FALLBACK FOR VIDEOS: Try static thumbnail if specific frame extraction fails
-                if source_img is None:
-                    thumb_path = self.img_proc.get_thumbnail_path(file_path)
-                    if os.path.exists(thumb_path):
-                        with open(thumb_path, 'rb') as f:
-                            buf = np.frombuffer(f.read(), dtype=np.uint8)
-                            source_img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-            else:
-                # IMAGES: Standardize orientation with AI detection (v2.1 Fix)
-                try:
-                    # Using PIL for EXIF-aware loading (Matches FaceProcessor)
-                    with Image.open(file_path) as img_pil:
-                        img_pil = ImageOps.exif_transpose(img_pil)
-                        img_pil = img_pil.convert('RGB')
-                        source_img = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
-                except Exception as e:
-                    logger.error(f"FaceCropWorker: PIL orientation error for {file_path}: {e}")
-                    # Fallback to raw OpenCV if PIL fails
-                    try:
-                        with open(file_path, 'rb') as f:
-                            buf = np.frombuffer(f.read(), dtype=np.uint8)
-                            source_img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-                    except:
-                        pass
-
-            if source_img is None:
-                logger.error(f"FaceCropWorker: Source image is None for {file_path}")
-                return
-
-            ih, iw = source_img.shape[:2]
-            x1, y1, x2, y2 = bbox
-            
-            # Add subtle padding (30%) to make the face easier to see
-            w, h = x2 - x1, y2 - y1
-            x1_p, y1_p = max(0, x1 - w * 0.3), max(0, y1 - h * 0.3)
-            x2_p, y2_p = min(iw, x2 + w * 0.3), min(ih, y2 + h * 0.3)
-            
-            crop = source_img[int(y1_p):int(y2_p), int(x1_p):int(x2_p)]
-            if crop.size == 0: 
-                # Fallback to un-padded if padding was out of bounds
-                crop = source_img[int(y1):int(y2), int(x1):int(x2)]
-                if crop.size == 0: return
-
-            crop = cv2.resize(crop, (150, 150), interpolation=cv2.INTER_AREA)
-            _, buffer = cv2.imencode('.jpg', crop)
-            buffer.tofile(cache_path)
-        except Exception as e:
-            logger.error(f"Error in _generate_single_crop for face {face_data.get('face_id')}: {e}")
-
-class FaceCropManager(QObject):
-    """
-    Centralized Rendering Engine for large-scale libraries (v2.2 Overhaul).
-    Manages a global FIFO queue and coordinates worker threads to prevent I/O saturation.
-    """
-    _instance = None
-    images_ready = Signal(list)
-    image_failed = Signal(int)
-    queue_updated = Signal(int) # remaining count
-
-    @classmethod
-    def get_instance(cls, db=None):
-        if cls._instance is None:
-            if db is None: raise ValueError("DB required for first init")
-            cls._instance = cls(db)
-        return cls._instance
-
-    def __init__(self, db):
-        super().__init__()
-        self.db = db
-        self.queue = []
-        self.processing_ids = set()
-        self.active_workers = []
-        self.max_parallel = 3 # Optimal for balanced I/O
-        self.timer = QTimer()
-        self.timer.timeout.connect(self._process_queue)
-        self.timer.start(100) # Check queue every 100ms
-
-    def enqueue_items(self, items):
-        """Adds new face crop requests to the global queue."""
-        added = 0
-        for item in items:
-            fid = item.get("face_id")
-            if fid not in self.processing_ids:
-                self.queue.append(item)
-                self.processing_ids.add(fid)
-                added += 1
-        if added > 0:
-            self.queue_updated.emit(len(self.queue))
-            logger.info(f"FaceCropManager: Enqueued {added} items. Total queue: {len(self.queue)}")
-
-    def _process_queue(self):
-        # Cleanup finished workers
-        self.active_workers = [w for w in self.active_workers if w.isRunning()]
-        
-        if not self.queue or len(self.active_workers) >= self.max_parallel:
-            return
-            
-        # Take a chunk of work
-        chunk_size = 50
-        chunk = self.queue[:chunk_size]
-        self.queue = self.queue[chunk_size:]
-        self.queue_updated.emit(len(self.queue))
-        
-        worker = FaceCropWorker(self.db, chunk, manager=self)
-        worker.images_ready.connect(self.images_ready)
-        worker.image_failed.connect(self.image_failed)
-        worker.finished.connect(lambda: self._on_worker_finished(chunk))
-        self.active_workers.append(worker)
-        worker.start()
-
-    def _on_worker_finished(self, chunk):
-        for item in chunk:
-            fid = item.get("face_id")
-            if fid in self.processing_ids:
-                self.processing_ids.remove(fid)
-        self.queue_updated.emit(len(self.queue))
-
-class SidebarLoadWorker(QThread):
-    """Loads top-level sidebar counts and person list for instant UI initialization."""
-    data_loaded = Signal(dict, list) # counts, persons
-
-    def __init__(self, db):
-        super().__init__()
-        self.db = db
-
-    def run(self):
-        logger.info("SidebarLoadWorker: Starting run() [Instant Mode]")
-        try:
-            # 1. Base counts for unknowns/ignored
-            logger.info("SidebarLoadWorker: Fetching face counts...")
-            counts = self.db.get_face_counts()
-
-            # 2. Persons list
-            logger.info("SidebarLoadWorker: Fetching person list...")
-            persons = self.db.get_person_list_with_counts()
-            
-            logger.info("SidebarLoadWorker: Emitting top-level data_loaded signal")
-            self.data_loaded.emit(counts, persons)
-        except Exception as e:
-            import traceback
-            logger.error(f"SidebarLoadWorker ERROR: {e}\n{traceback.format_exc()}")
-            self.data_loaded.emit({}, [])
-
-class PersonDateLoadWorker(QThread):
-    """Async loader for a specific person's or category's dates when expanded."""
-    dates_loaded = Signal(QTreeWidgetItem, list) # (node_item, date_list)
-
-    def __init__(self, db, item, cid):
-        super().__init__()
-        self.db = db
-        self.item = item
-        self.cid = cid # -1: Unknown, -2: Ignored, or PersonID
-
-    def run(self):
-        logger.info(f"PersonDateLoadWorker: Loading dates for CID {self.cid}")
-        try:
-            category = 'person'
-            pid = self.cid
-            if self.cid == -1: 
-                category = 'unknown'
-                pid = None
-            elif self.cid == -2: 
-                category = 'ignored'
-                pid = None
-            
-            dates = self.db.get_face_dates_by_category(category, pid)
-            logger.info(f"PersonDateLoadWorker: Found {len(dates)} dates for CID {self.cid}")
-            self.dates_loaded.emit(self.item, dates)
-        except Exception as e:
-            logger.error(f"PersonDateLoadWorker ERROR: {e}")
-            self.dates_loaded.emit(self.item, [])
-
-class FaceModel(QAbstractListModel):
-    """Memory-efficient model for face data and headers."""
-    def __init__(self, parent=None):
+class FaceReviewDialog(QDialog):
+    """Dialog for visual confirmation of outliers before removal."""
+    def __init__(self, faces: list[FaceInfo], title: str, parent=None):
         super().__init__(parent)
-        self._data = []
-
-    def rowCount(self, parent=QModelIndex()):
-        if parent.isValid():
-            return 0
-        return len(self._data)
-
-    def data(self, index, role=Qt.DisplayRole):
-        if not index.isValid(): return None
-        row = index.row()
-        if row >= len(self._data): return None
+        self.setWindowTitle(title)
+        self.setMinimumSize(800, 600)
         
-        if role == Qt.UserRole:
-            return self._data[row]
-        return None
-
-    def get_item(self, row):
-        if 0 <= row < len(self._data):
-            return self._data[row]
-        return None
-
-    def setData(self, index, value, role=Qt.EditRole):
-        if not index.isValid(): return False
-        if role == Qt.UserRole:
-            self._data[index.row()] = value
-            self.dataChanged.emit(index, index, [Qt.UserRole])
-            return True
-        return False
-
-    def update_image_data(self, face_id, qimage):
-        """Updates a face record with its cropped image pixmap without reloading everything."""
-        for i in range(len(self._data)):
-            item = self._data[i]
-            if not item.get("is_header") and item.get("face_id") == face_id:
-                item["qimage"] = qimage
-                idx = self.index(i, 0)
-                self.dataChanged.emit(idx, idx, [Qt.UserRole, Qt.DecorationRole])
-                break
-
-    def mark_image_failed(self, face_id):
-        """Stops the retry animation for items that cannot be loaded."""
-        for i in range(len(self._data)):
-            item = self._data[i]
-            if not item.get("is_header") and item.get("face_id") == face_id:
-                item["needs_crop"] = False
-                item["failed"] = True
-                idx = self.index(i, 0)
-                self.dataChanged.emit(idx, idx, [Qt.UserRole, Qt.DecorationRole])
-                break
-
-    def append_data(self, additional_data):
-        if not additional_data: return
-        first = len(self._data)
-        last = first + len(additional_data) - 1
-        self.beginInsertRows(QModelIndex(), first, last)
-        self._data.extend(additional_data)
-        self.endInsertRows()
-
-    def clear(self):
-        self.beginResetModel()
-        self._data = []
-        self.endResetModel()
-
-    def select_all_in_date_range(self, date_key):
-        """Selects all items belonging to a specific date header with precision signaling."""
-        in_group = False
-        min_row = -1
-        max_row = -1
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            f"成長の連鎖から外れている可能性がある写真が {len(faces)} 枚見つかりました。\n"
+            "画像を確認し、人物から解除（『不明』に戻す）するものを選んでください。"
+        ))
         
-        for i in range(len(self._data)):
-            item = self._data[i]
-            if item.get("is_header"):
-                in_group = (item.get("date_header") == date_key)
-                if in_group:
-                    min_row = i if min_row == -1 else min_row
-                continue
-            
-            if in_group:
-                item["selected"] = True
-                min_row = i if min_row == -1 else min_row
-                max_row = i
+        self.grid = ThumbnailGrid()
+        self.grid.set_crop_mode(True)
+        layout.addWidget(self.grid)
         
-        # Precision signal for stability and performance
-        if min_row != -1 and max_row != -1:
-            self.dataChanged.emit(self.index(min_row, 0), self.index(max_row, 0), [Qt.UserRole])
+        # Populate grid items (pre-selected by default)
+        display_items = []
+        cache_dir = get_face_cache_dir()
+        for f in faces:
+            cp = os.path.join(cache_dir, f"face_{f.face_id}.jpg")
+            item = FaceDisplayItem(face=f, image=cp if os.path.exists(cp) else None)
+            item.selected = True # Pre-select for review
+            display_items.append(item)
+        
+        self.grid.append_data(display_items)
+        
+        # Generate missing crops in background
+        self.crop_worker = FaceCropWorker(faces)
+        self.crop_worker.batch_finished.connect(self.grid.media_model.update_face_image_batch)
+        self.crop_worker.start()
+        
+        btns = QHBoxLayout()
+        btn_ok = QPushButton("選択した写真を『不明』に戻す")
+        btn_ok.setMinimumHeight(40)
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel = QPushButton("キャンセル")
+        btn_cancel.setMinimumHeight(40)
+        btn_cancel.clicked.connect(self.reject)
+        
+        btns.addStretch()
+        btns.addWidget(btn_cancel)
+        btns.addWidget(btn_ok)
+        layout.addLayout(btns)
 
-    def get_selection_count(self):
-        return sum(1 for item in self._data if not item.get("is_header") and item.get("selected"))
+    def get_selected_ids(self) -> list[int]:
+        return [
+            item.face.face_id 
+            for item in self.grid.media_model._data 
+            if isinstance(item, FaceDisplayItem) and item.selected
+        ]
 
-class FaceDelegate(QStyledItemDelegate):
-    """Custom painter for face items and date headers."""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.item_size = QSize(140, 160)
-        self.img_size = QSize(130, 130)
-        # Modern Palette: Sleek Dark / Glass-inspired
-        # Modern Palette: Sleek Dark / Library-Compliant
-        self.bg_color = QColor("#121421")           # Deeper background
-        self.card_bg = QColor("#1A1D2E")            # Card background
-        self.header_bg = QColor("#1F2336")          # Library header standard
-        self.border_color = QColor("#2D324A")       # Standard border
-        self.accent_color = QColor("#3D5AFE")       # Vibrant Blue
-        self.accent_glow = QColor(61, 90, 254, 100) # Increased alpha for visibility
-        self.text_muted = QColor("#94A3B8")         # Slate muted text
-        self.text_header = QColor("#F1F5F9")        # Primary light text
-        self.separator_color = QColor("#2D324A")
-        self._pixmap_cache = {}
-
-    def paint(self, painter, option, index):
-        try:
-            painter.save()
-            painter.setRenderHint(QPainter.Antialiasing)
-            
-            data = index.data(Qt.UserRole)
-            if not data:
-                painter.restore()
-                return
-
-            rect = option.rect
-            if data.get("is_header"):
-                # Milestone 2: Exact Library-Style Header
-                # 1. Background
-                painter.setBrush(QBrush(self.header_bg)) 
-                painter.setPen(Qt.NoPen)
-                painter.drawRect(rect)
-                
-                # 2. Left Accent Vertical Bar (5px width)
-                accent_bar = QRect(rect.left(), rect.top() + 15, 5, rect.height() - 30)
-                painter.setBrush(QBrush(self.accent_color))
-                painter.drawRoundedRect(accent_bar, 2, 2)
-                
-                # 3. Text Styling & Dynamic Divider Line
-                painter.setPen(QPen(self.text_header))
-                font = QFont("Inter", 12, QFont.Bold)
-                painter.setFont(font)
-                header_text = data.get("date_header", "不明な日付")
-                
-                # Calculate text width for the divider
-                metrics = painter.fontMetrics()
-                tw = metrics.horizontalAdvance(header_text)
-                painter.drawText(rect.adjusted(30, 0, 0, 0), Qt.AlignVCenter | Qt.AlignLeft, header_text)
-                
-                # Draw divider line (ThumbnailGrid style)
-                line_y = rect.center().y()
-                painter.setPen(QPen(self.separator_color, 1))
-                painter.drawLine(rect.left() + tw + 45, line_y, rect.right() - 180, line_y)
-                
-                # Top/Bottom Boundaries
-                painter.setPen(QPen(self.separator_color, 1))
-                painter.drawLine(rect.topLeft(), rect.topRight())
-                painter.drawLine(rect.bottomLeft(), rect.bottomRight())
-                
-                # 4. "Select This Day" Button UI (Sophisticated Glassmorphism)
-                btn_rect = QRect(rect.right() - 160, rect.top() + (rect.height() - 34)//2, 140, 34)
-                is_btn_hover = bool(option.state & QStyle.State_MouseOver)
-                
-                painter.setBrush(QBrush(QColor(61, 90, 254, 50) if is_btn_hover else QColor(30, 30, 50, 100)))
-                painter.setPen(QPen(self.accent_color, 1.5))
-                painter.drawRoundedRect(btn_rect, 17, 17) # Capsule style
-                
-                painter.setPen(QPen(QColor("#FFFFFF")))
-                painter.setFont(QFont("Inter", 8, QFont.Bold))
-                painter.drawText(btn_rect, Qt.AlignCenter, "この日を全選択")
-                painter.restore()
-                return
-
-            is_hovered = bool(option.state & QStyle.State_MouseOver)
-            is_selected = data.get("selected", False)
-            rect = option.rect.adjusted(4, 4, -4, -4)
-            
-            # Avoid invalid rects
-            if rect.width() <= 0 or rect.height() <= 0:
-                painter.restore()
-                return
-            
-            # Draw Border & Background
-            painter.setBrush(QBrush(self.card_bg if not (is_selected or is_hovered) else QColor("#24293E")))
-            pen = QPen(self.accent_color if (is_selected or is_hovered) else self.border_color, 4 if is_selected else 1)
-            painter.setPen(pen)
-            painter.drawRoundedRect(rect, 10, 10)
-            
-            if is_selected:
-                # Stronger selection overlay
-                painter.setBrush(QBrush(self.accent_glow))
-                painter.drawRoundedRect(rect, 10, 10)
-
-            # Draw Image area
-            img_rect = QRect(rect.left() + 5, rect.top() + 5, self.img_size.width(), self.img_size.height())
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QBrush(QColor("#0F111A")))
-            painter.drawRoundedRect(img_rect, 4, 4)
-            
-            # Access pre-loaded image (QImage to QPixmap conversion is fast but we still use cache)
-            face_id = data.get("face_id")
-            pix = self._pixmap_cache.get(face_id)
-            qimg = data.get("qimage")
-            
-            # Cache invalidation: If model has an image but cache doesn't (or it's different)
-            if qimg and not qimg.isNull():
-                if pix is None:
-                    pix = QPixmap.fromImage(qimg)
-                    if len(self._pixmap_cache) > 2000: self._pixmap_cache.clear()
-                    self._pixmap_cache[face_id] = pix
-            
-            if pix:
-                painter.drawPixmap(img_rect, pix)
-            else:
-                # Milestone 3: Live Pulsing Placeholder for missing crops
-                painter.setPen(Qt.NoPen)
-                painter.setBrush(QBrush(QColor(30, 35, 55, 200))) # Darker stylized grey
-                painter.drawRoundedRect(img_rect, 4, 4)
-                
-                # Pulse Calculation (Subtle 1.0s period)
-                try:
-                    import time
-                    pulse = (np.sin(time.time() * 6.28) + 1) / 2 # 0.0 to 1.0 range
-                except:
-                    pulse = 0.5
-                
-                is_failed = data.get("failed", False)
-                symbol = "🚫" if is_failed else "⌛"
-                label = "読込不可" if is_failed else "解析中..."
-                
-                # Draw Placeholder UI (Icon + Text)
-                painter.setPen(QPen(QColor("#FF4B2B") if is_failed else self.accent_color, 1.5))
-                painter.setOpacity(0.4 + (pulse * 0.6) if not is_failed else 0.8)
-                painter.setFont(QFont("Inter", 14))
-                painter.drawText(img_rect.adjusted(0, -20, 0, 0), Qt.AlignCenter, symbol)
-                
-                painter.setOpacity(1.0)
-                painter.setPen(QPen(self.text_muted))
-                painter.setFont(QFont("Inter", 8, QFont.Medium))
-                painter.drawText(img_rect.adjusted(0, 30, 0, 0), Qt.AlignCenter, label)
-
-            # Draw Capture Date / ID label
-            date_str = data.get("capture_date", "日付不明")
-            face_id = data.get("face_id", "?")
-            display_text = f"ID: {face_id} | {date_str[:10].replace(':', '/')}"
-            painter.setPen(QPen(self.text_muted))
-            painter.setFont(QFont("Inter", 8, QFont.Medium))
-            painter.drawText(QRect(rect.left(), img_rect.bottom() + 5, rect.width(), 20), Qt.AlignCenter, display_text)
-            
-            painter.restore()
-        except Exception as e:
-            # Safe recovery in paint
-            if painter:
-                try: painter.restore()
-                except: pass
-
-    def sizeHint(self, option, index):
-        data = index.data(Qt.UserRole)
-        if data and data.get("is_header"):
-            # Library Standard Height (Milestone 2)
-            # FIX: Window-Crossing / Full Width dynamic calculation
-            view = self.parent()
-            if view:
-                # We subtract a small amount for the scrollbar/margins
-                return QSize(view.viewport().width() - 20, 80)
-            return QSize(800, 80)
-        return self.item_size + QSize(10, 10)
 
 class FaceManagerView(QWidget):
-    """Main view for face management with sidebar and virtualized list."""
     refresh_requested = Signal()
-    load_next_page = Signal()
 
-    def __init__(self, db, parent=None):
-        super().__init__(parent)
+    def __init__(self, db: Database, repo: FaceRepository) -> None:
+        super().__init__()
         self.db = db
-        self.current_category_id = None
-        self.current_date = None
-        self.page_size = 500
-        self.current_offset = 0
-        self.last_item_date = None
-        self.last_item_id = None
+        self.repo = repo
         self.is_suggestion_mode = False
-        self.suggestion_worker = None
-        self.target_person_id = None
-        self.load_count = 0
+        self.current_category_id = -1
+        self.current_threshold = 0.8
+        self.person_centroid = None
+        self.active_workers: list[QThread] = []
+
+        # Seek Markers
+        self.last_capture_date: Optional[str] = None
+        self.last_face_id: Optional[int] = None
+        self.has_more = True
         self.is_loading = False
-        self.all_loaded = False
-        self.last_date_key = None
-        self.active_workers = [] # Engine Connectivity (v2.2 Overhaul)
-        self.cache_dir = get_face_cache_dir()
+        self.last_key: Optional[tuple[str, str]] = None
+
         self.init_ui()
-        
-        self.render_engine = FaceCropManager.get_instance(self.db)
-        self.render_engine.images_ready.connect(self._on_images_batch_ready)
-        self.render_engine.image_failed.connect(self.face_model.mark_image_failed)
-        self.render_engine.queue_updated.connect(self._update_engine_status)
-        self.load_next_page.connect(self._trigger_load_next_chunk)
-        
-        # Ensure data is ready on first show (Milestone 1)
-        # We use a single-shot timer to avoid blocking during view construction
-        QTimer.singleShot(500, self.refresh_sidebar)
-        
-        # Animation Timer (Milestone 3)
-        self.animation_timer = QTimer(self)
-        self.animation_timer.timeout.connect(lambda: self.list_view.viewport().update())
-        self.animation_timer.start(100) # 10 FPS is enough for subtle pulsing
 
-    def _update_engine_status(self, count):
-        if count > 0:
-            self.status_label.setText(f"⚙️ キュー詰まり: 残り {count} 枚")
-        else:
-            self.status_label.setText("✅ 処理完了")
+    def init_ui(self) -> None:
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-    def _track_worker(self, worker):
-        """Maintains a reference to the worker until it finishes to prevent crash 0xC0000409."""
-        logger.info(f"Tracking worker: {type(worker).__name__} (ID: {id(worker)})")
-        if worker not in self.active_workers:
-            self.active_workers.append(worker)
-            worker.finished.connect(lambda: self._cleanup_worker(worker))
-            # Some workers use specific finished signals
-            if hasattr(worker, 'finished_batch'):
-                worker.finished_batch.connect(lambda: self._cleanup_worker(worker))
-        return worker
+        splitter = QSplitter(Qt.Horizontal)
 
-    def _cleanup_worker(self, worker):
-        """Safely removes worker from tracking list after completion."""
-        try:
-            if worker in self.active_workers:
-                self.active_workers.remove(worker)
-                logger.info(f"Worker tracking cleanup: {type(worker).__name__} (ID: {id(worker)})")
-        except:
-            pass
+        # Left: Sidebar
+        self.sidebar = MediaTreeView()
+        self.sidebar.clicked.connect(self._on_sidebar_selected)
+        splitter.addWidget(self.sidebar)
 
-    def init_ui(self):
-        main_layout = QHBoxLayout(self)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        self.splitter = QSplitter(Qt.Horizontal)
-        
-        # Sidebar Panel (Tree Mode)
-        sidebar_panel = QWidget()
-        sidebar_layout = QVBoxLayout(sidebar_panel)
-        self.sidebar = QTreeWidget()
-        self.sidebar.setHeaderHidden(True)
-        self.sidebar.setIndentation(15)
-        self.sidebar.setStyleSheet("""
-            QTreeWidget { background-color: #1A1D2E; color: #A0AEC0; border: none; }
-            QTreeWidget::item { height: 32px; }
-            QTreeWidget::item:selected { background-color: #3D5AFE; color: white; }
-        """)
-        self.sidebar.itemClicked.connect(self.on_sidebar_item_clicked)
-        self.sidebar.itemExpanded.connect(self.on_sidebar_item_expanded)
-        self.sidebar.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.sidebar.customContextMenuRequested.connect(self.show_sidebar_menu)
-        sidebar_layout.addWidget(self.sidebar)
-        self.btn_refresh_sidebar = QPushButton("🔄 更新")
-        self.btn_refresh_sidebar.clicked.connect(self.refresh_sidebar)
-        sidebar_layout.addWidget(self.btn_refresh_sidebar)
-        self.splitter.addWidget(sidebar_panel)
-
-        # Right Panel Area
+        # Right: Content
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        
-        # Toolbar for Person/Manual Actions (v2.3)
-        self.toolbar = QWidget()
-        t_layout = QHBoxLayout(self.toolbar)
-        t_layout.setContentsMargins(10, 5, 10, 5)
-        
+
+        # Toolbar
+        t_layout = QHBoxLayout()
         self.suggestion_btn = QPushButton("🔎 AI提案を表示")
         self.suggestion_btn.setCheckable(True)
         self.suggestion_btn.clicked.connect(self.toggle_suggestion_mode)
-        
-        self.select_all_btn = QPushButton("全て選択")
-        self.deselect_all_btn = QPushButton("選択解除")
-        self.select_all_btn.clicked.connect(self._select_all_current)
-        self.deselect_all_btn.clicked.connect(self._deselect_all_current)
-        
-        # Action Buttons
-        self.confirm_btn = QPushButton("この人物に確定")
-        self.new_person_btn = QPushButton("新規人物")
-        self.other_person_btn = QPushButton("別の登録人物")
-        self.ignore_btn = QPushButton("無視/削除")
-        
-        self.confirm_btn.clicked.connect(self._on_confirm_selection)
-        self.new_person_btn.clicked.connect(self._on_new_selection)
-        self.other_person_btn.clicked.connect(self._on_other_person_selection)
-        self.ignore_btn.clicked.connect(self._on_ignore_selection)
-        
-        # Styling Action Buttons
-        self.confirm_btn.setStyleSheet("background: #00C853; color: white; border-radius: 4px; padding: 4px 10px;")
-        self.new_person_btn.setStyleSheet("background: #2979FF; color: white; border-radius: 4px; padding: 4px 10px;")
-        
         t_layout.addWidget(self.suggestion_btn)
-        t_layout.addSpacing(20)
-        t_layout.addWidget(self.select_all_btn)
-        t_layout.addWidget(self.deselect_all_btn)
+
+        # --- Suggestion Bulk Actions Toolbar ---
+        self.bulk_container = QWidget()
+        self.bulk_layout = QHBoxLayout(self.bulk_container)
+        self.bulk_layout.setContentsMargins(10, 0, 0, 0)
+        self.bulk_layout.setSpacing(5)
+
+        btn_all = QPushButton("全選択")
+        btn_none = QPushButton("選択解除")
+
+        btn_all.clicked.connect(lambda: self.face_grid.select_all(True))
+        btn_none.clicked.connect(lambda: self.face_grid.select_all(False))
+
+        # --- Sort Order ---
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItems(["日付 (新しい順)", "日付 (古い順)", "類似度 (高い順)", "類似度 (低い順)"])
+        self.sort_combo.currentIndexChanged.connect(self._on_sort_changed)
+        self.bulk_layout.addWidget(QLabel("並べ替え:"))
+        self.bulk_layout.addWidget(self.sort_combo)
+
+        # --- Threshold Selection ---
+        self.btn_set_threshold = QPushButton(f"しきい値を設定 ({self.current_threshold:.2f})")
+        self.btn_set_threshold.clicked.connect(self._on_set_threshold_clicked)
+        self.bulk_layout.addWidget(self.btn_set_threshold)
+
+        self.btn_select_thresh = QPushButton("しきい値以上を選択")
+        self.btn_select_thresh.clicked.connect(self.select_by_threshold)
+        self.bulk_layout.addWidget(self.btn_select_thresh)
+
+        self.bulk_layout.addWidget(btn_all)
+        self.bulk_layout.addWidget(btn_none)
+
+        # --- Optimization ---
+
+        self.btn_optimize = QPushButton("人物の再編・最適化")
+        self.btn_optimize.clicked.connect(self._on_optimize_person_clicked)
+        self.bulk_layout.addWidget(self.btn_optimize)
+
+        self.bulk_container.setVisible(True) # Persistent by default
+        t_layout.addWidget(self.bulk_container)
         t_layout.addStretch()
-        t_layout.addWidget(self.confirm_btn)
-        t_layout.addWidget(self.new_person_btn)
-        t_layout.addWidget(self.ignore_btn)
-        
-        self.toolbar.setVisible(False)
-        
-        # Virtualized Grid View Performance Configuration
-        self.list_view = QListView()
-        self.list_view.setViewMode(QListView.IconMode)
-        self.list_view.setResizeMode(QListView.Adjust)
-        self.list_view.setMovement(QListView.Static)
-        self.list_view.setSpacing(12)
-        # Disable fixed gridSize to allow sizeHint to determine header vs item height
-        self.list_view.setUniformItemSizes(False) 
-        self.list_view.setLayoutMode(QListView.Batched)
-        self.list_view.setBatchSize(100)
-        self.list_view.setStyleSheet("background-color: #0F111A; border: none; outline: none;")
-        
-        self.face_model = FaceModel(self)
-        self.list_view.setModel(self.face_model)
-        self.face_delegate = FaceDelegate(self.list_view)
-        self.list_view.setItemDelegate(self.face_delegate)
-        
-        vp = self.list_view.viewport()
-        if vp:
-            vp.installEventFilter(self)
-        self.list_view.verticalScrollBar().valueChanged.connect(self.on_scroll_moved)
-        right_layout.addWidget(self.toolbar)
-        right_layout.addWidget(self.list_view)
-        
-        self.splitter.addWidget(right_panel)
-        main_layout.addWidget(self.splitter)
+        right_layout.addLayout(t_layout)
+
+        # Grid
+        self.face_grid = ThumbnailGrid()
+        self.face_grid.tag_clicked.connect(self.on_tag_clicked)
+        self.face_grid.near_bottom_reached.connect(self.load_more_faces)
+        self.face_grid.context_menu_requested.connect(self._show_context_menu)
+        self.face_grid.item_clicked.connect(self._open_original_media)
+        self.face_grid.set_crop_mode(True)
+        right_layout.addWidget(self.face_grid)
 
         self.loading_bar = QProgressBar()
-        self.loading_bar.setTextVisible(False)
-        self.loading_bar.setFixedHeight(2)
-        self.loading_bar.setStyleSheet("QProgressBar { background: transparent; border: none; } QProgressBar::chunk { background: #3d5afe; }")
-        
-        # Engine Status Label (v2.2)
-        self.status_label = QPushButton("✅ エンジン待機中")
-        self.status_label.setFlat(True)
-        self.status_label.setStyleSheet("color: #8899AA; font-size: 10px; border: none; margin-right: 15px;")
-        
         self.loading_bar.setVisible(False)
-        t_layout.addWidget(self.status_label)
-        t_layout.addWidget(self.loading_bar)
-        
-        # Note: Sidebar refresh is triggered by MainWindow on transition.
+        right_layout.addWidget(self.loading_bar)
 
-    def eventFilter(self, source, event):
-        if source is self.list_view.viewport() and event.type() == QEvent.MouseButtonPress:
-            index = self.list_view.indexAt(event.pos())
-            if index.isValid():
-                data = index.data(Qt.UserRole)
-                if not data: return False
-                
-                if data.get("is_header"):
-                    # Click on Select All area in header
-                    rect = self.list_view.visualRect(index)
-                    if rect.right() - 140 <= event.pos().x() <= rect.right() - 20:
-                        self.face_model.select_all_in_date_range(data.get("date_header"))
-                        self.update_bulk_buttons()
-                        return True
-                else:
-                    if event.button() == Qt.LeftButton:
-                        new_data = data.copy()
-                        new_data["selected"] = not data.get("selected", False)
-                        self.face_model.setData(index, new_data, Qt.UserRole)
-                        self.update_bulk_buttons()
-                        return True
-                    elif event.button() == Qt.RightButton:
-                        self.show_face_menu(data["face_id"], event.globalPos())
-                        return True
-        return super().eventFilter(source, event)
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 4)
+        splitter.setSizes([250, 1000])
+        layout.addWidget(splitter)
 
-    def showEvent(self, event):
-        """Force a refresh when the view becomes visible to the user."""
-        super().showEvent(event)
-        logger.info("FaceManagerView: showEvent triggered")
-        self.refresh_sidebar()
-
-    def refresh_sidebar(self):
-        logger.info("FaceManagerView: refresh_sidebar() called")
-        # Check if we already have a running SidebarLoadWorker
-        for w in self.active_workers:
-            if isinstance(w, SidebarLoadWorker) and w.isRunning():
-                logger.info("SidebarLoadWorker is already running. Skipping...")
-                return
-
-        # Immediate UI Feedback: show placeholder items
-        self.sidebar.clear()
-        self.sidebar.addTopLevelItem(QTreeWidgetItem(["⌛ 読み込み中..."]))
-        
-        worker = SidebarLoadWorker(self.db)
-        worker.data_loaded.connect(self.on_sidebar_loaded)
-        self._track_worker(worker)
-        worker.start()
-        logger.info(f"FaceManagerView: SidebarLoadWorker started (ID: {id(worker)})")
-
-    @Slot(dict, list)
-    def on_sidebar_loaded(self, counts, persons):
-        logger.info(f"on_sidebar_loaded: Received top-level data. Persons count: {len(persons)}")
-        try:
-            self.sidebar.clear()
-            
-            # 1. Base counts (Unknown/Ignored)
-            for label, cid in [("❓ 不明", -1), ("🚫 無視", -2)]:
-                key_name = 'unknown' if cid == -1 else 'ignored'
-                cnt = counts.get(key_name, 0)
-                node = QTreeWidgetItem([f"{label} ({cnt})"])
-                node.setData(0, Qt.UserRole, (cid, None)) # (category_id, date_filter)
-                self.sidebar.addTopLevelItem(node)
-                
-                # Add dummy child to show expansion arrow if count > 0
-                if cnt > 0:
-                    dummy = QTreeWidgetItem(["⌛ 読み込み中..."])
-                    node.addChild(dummy)
-            
-            # 2. People
-            if not persons and not counts.get('unknown'):
-                if not self.sidebar.topLevelItemCount():
-                    self.sidebar.addTopLevelItem(QTreeWidgetItem(["ℹ️ 解析済みの顔はありません"]))
-            
-            for cid, name, count in persons:
-                if count <= 0: continue # SKIP zero-count persons
-                display_name = name or f"Person {cid}"
-                node = QTreeWidgetItem([f"👤 {display_name} ({count})"])
-                node.setData(0, Qt.UserRole, (cid, None))
-                self.sidebar.addTopLevelItem(node)
-                
-                # Add dummy child
-                if count > 0:
-                    dummy = QTreeWidgetItem(["⌛ 読み込み中..."])
-                    node.addChild(dummy)
-            
-            logger.info("on_sidebar_loaded: Instant sidebar population complete")
-        except Exception as e:
-            import traceback
-            logger.error(f"on_sidebar_loaded ERROR: {e}\n{traceback.format_exc()}")
-            self.sidebar.clear()
-            self.sidebar.addTopLevelItem(QTreeWidgetItem(["❌ 読み込みエラー"]))
-
-    def _on_confirm_selection(self):
-        """Associates selected faces with the target person."""
-        ids = self.get_selected_face_ids()
-        if not ids or not self.target_person_id: return
-        self._do_bulk_associate(ids, self.target_person_id)
-
-    def _on_new_selection(self):
-        """Registers selected faces as a completely new person."""
-        ids = self.get_selected_face_ids()
-        if not ids: return
-        worker = PersonManagementWorker(self.db, PersonAction.REGISTER_NEW, {"face_ids": ids})
-        worker.refresh_requested.connect(self.on_person_refresh_requested)
-        self._track_worker(worker)
-        worker.start()
-
-    def _on_ignore_selection(self):
-        """Marks selected faces as ignored."""
-        ids = self.get_selected_face_ids()
-        if not ids: return
-        worker = PersonManagementWorker(self.db, PersonAction.IGNORE, {"face_ids": ids})
-        worker.refresh_requested.connect(self.on_person_refresh_requested)
-        self._track_worker(worker)
-        worker.start()
-
-    def _on_other_person_selection(self):
-        """Shows a menu of existing persons to associate with."""
-        ids = self.get_selected_face_ids()
-        if not ids: return
-        
-        menu = QMenu(self)
-        persons = self.db.get_person_list_with_counts()
-        for pid, name, count in persons:
-            action = menu.addAction(f"{name or f'Person {pid}'} ({count})")
-            action.triggered.connect(lambda checked=False, p=pid: self._do_bulk_associate(ids, p))
-        
-        menu.exec(self.other_person_btn.mapToGlobal(QPoint(0, self.other_person_btn.height())))
-
-    def on_sidebar_item_expanded(self, item):
-        """Triggered when a user clicks the expand (▶) arrow."""
-        data = item.data(0, Qt.UserRole)
-        if not data: return
-        cid, date_filter = data
-        
-        # Check if we have a dummy child (needs loading)
-        if item.childCount() == 1 and item.child(0).text(0) == "⌛ 読み込み中...":
-            logger.info(f"Lazy loading dates for item: {item.text(0)}")
-            worker = PersonDateLoadWorker(self.db, item, cid)
-            worker.dates_loaded.connect(self.on_dates_loaded)
+    def refresh_sidebar(self) -> None:
+        with Profiler("FaceManagerView.refresh_sidebar"):
+            defaults = [("❓ 不明", -1, 0), ("🚫 無視", -2, 0)]
+            self.sidebar.initialize_categories(defaults, add_defaults=False)
+            worker = SidebarLoadWorker(self.repo)
+            worker.result_ready.connect(self.on_sidebar_loaded)
             self._track_worker(worker)
             worker.start()
 
-    @Slot(QTreeWidgetItem, list)
-    def on_dates_loaded(self, item, dates):
-        """Populates sub-nodes for a specific person/category."""
-        try:
-            # Clear dummy
-            item.takeChild(0)
-            
-            data = item.data(0, Qt.UserRole)
-            cid = data[0] if data else -1
-            
-            for dk, dcnt in dates:
-                d_node = QTreeWidgetItem([f"📅 {dk} ({dcnt})"])
-                # Store date filter in UserRole: (category_id, date_string)
-                d_node.setData(0, Qt.UserRole, (cid, dk))
-                item.addChild(d_node)
-            
-            logger.info(f"Lazy load complete for: {item.text(0)}")
-        except Exception as e:
-            logger.error(f"on_dates_loaded ERROR: {item.text(0)}: {e}")
+    @Slot(object)
+    def on_sidebar_loaded(self, res: Any) -> None:
+        with Profiler("FaceManagerView.on_sidebar_loaded"):
+            try:
+                counts: Optional[FaceCountsResult] = getattr(res, "counts", None)
+                persons: list[ClusterInfo] = getattr(res, "persons", [])
+                categories: list[tuple[str, int, int]] = []
 
-    def on_sidebar_item_clicked(self, item, column):
-        data = item.data(0, Qt.UserRole)
-        if data:
-            cid, date_val = data
-            self.load_faces(cid, date_val)
+                if counts:
+                    categories.append(("❓ 不明", -1, counts.unknown))
+                    categories.append(("🚫 無視", -2, counts.ignored))
+                    person_counts = counts.persons
+                else:
+                    categories.append(("❓ 不明", -1, 0))
+                    categories.append(("🚫 無視", -2, 0))
+                    person_counts = {}
 
-    def toggle_suggestion_mode(self):
-        """Toggles AI similarity suggestions for the currently selected person."""
-        self.is_suggestion_mode = self.suggestion_btn.isChecked()
-        logger.info(f"toggle_suggestion_mode: {self.is_suggestion_mode} for cat={self.current_category_id}")
-        
-        # Stop existing regular loaders
-        for w in self.active_workers[:]:
-             if isinstance(w, (FaceLoadWorker, FaceCropWorker)):
-                 try: w.stop()
-                 except: pass
+                for p in persons:
+                    label = p.custom_name or f"Person {p.cluster_id}"
+                    count = person_counts.get(p.cluster_id, 0)
+                    categories.append((label, p.cluster_id, count))
 
-        if self.is_suggestion_mode:
-            # Validate target
-            if self.current_category_id is None or self.current_category_id < 0:
-                QMessageBox.warning(self, "エラー", "AI提案を表示するには、サイドバーで特定の人物を選択してください。")
-                self.suggestion_btn.setChecked(False)
-                self.is_suggestion_mode = False
-                return
+                if hasattr(self.sidebar, "initialize_categories"):
+                    self.sidebar.initialize_categories(categories, add_defaults=False)
+            except Exception as e:
+                logger.error(f"FaceManager: on_sidebar_loaded failed: {e}")
 
-            self.face_model.clear()
-            self.target_person_id = self.current_category_id
-            
-            self.loading_bar.setVisible(True)
-            self.loading_bar.setRange(0, 0)
-            
-            self.suggestion_worker = FaceSuggestionWorker(self.db, self.target_person_id)
-            self.suggestion_worker.suggestions_ready.connect(self.on_suggestions_ready)
-            self.suggestion_worker.finished.connect(self.on_load_finished)
-            self._track_worker(self.suggestion_worker)
-            self.suggestion_worker.start()
-        else:
-            # Stop suggestion worker if running
-            if self.suggestion_worker and self.suggestion_worker.isRunning():
-                self.suggestion_worker.stop()
-                self.suggestion_worker.wait()
-            
-            # Reload regular faces
-            if self.current_category_id is not None:
-                self.load_faces(self.current_category_id, self.current_date)
+    def _on_sidebar_selected(self, index: QModelIndex) -> None:
+        item = self.sidebar.model.itemFromIndex(index)
+        if item:
+            self.load_faces(int(item.data(Qt.UserRole)))
 
-    @Slot(list)
-    def on_suggestions_ready(self, suggestions):
-        """Displays AI similarity results."""
-        if not self.is_suggestion_mode: return
-        logger.info(f"on_suggestions_ready: Received {len(suggestions)} suggestions.")
-        
-        formatted = []
-        cache_dir = get_face_cache_dir()
-        
-        # We'll batch these into groups for FaceCropWorker to generate thumbnails if missing
-        to_crop = []
-        
-        for info in suggestions:
-            face_id = info["face_id"]
-            cache_path = os.path.join(cache_dir, f"face_{face_id}.jpg")
+    def load_faces(self, category_id: int) -> None:
+        with Profiler(f"FaceManager.load_faces (cat={category_id})"):
+            self._cancel_active_workers()
+            self.current_category_id = category_id
+            self.last_key, self.last_capture_date, self.last_face_id = None, None, None
+            self.has_more, self.is_loading = True, False
+            self.person_centroid = None
+            self.face_grid.clear()
+            self.suggestion_btn.setChecked(False)
+            self.is_suggestion_mode = False
+            self.bulk_container.setVisible(True)
+            self.btn_set_threshold.setVisible(False)
+            self.btn_select_thresh.setVisible(False)
             
-            qimg = None
-            if os.path.exists(cache_path):
-                qimg = QImage(cache_path)
-                if qimg.isNull(): 
-                    logger.warning(f"on_suggestions_ready: Cache corrupted for face_{face_id}. Forcing regeneration.")
-                    info["needs_crop"] = True
-                    to_crop.append(info)
-                    qimg = None
-            else:
-                info["needs_crop"] = True
-                to_crop.append(info)
+            # Update ToolBar Visibility (Similarity Sort only for persons, not Unknown/Ignore)
+            is_person = self.current_category_id >= 0
+            self.sort_combo.setVisible(is_person)
+            self.btn_optimize.setVisible(is_person)
             
-            item_data = info.copy()
-            item_data.update({"qimage": qimg, "selected": False})
-            formatted.append(item_data)
-            
-        self.face_model.append_data(formatted)
-        
-        if to_crop:
-            self._start_crop_worker(to_crop)
-        
-        # Hide loading bar and stop indeterminate mode
-        self.on_load_finished()
-        self.all_loaded = True
+            self._fetch_chunk()
 
-    def load_faces(self, category_id, specific_date=None):
-        if self.is_loading and self.current_category_id == category_id and self.current_date == specific_date: 
-            return
-        
-        # Milestone 1: Non-blocking transitions (Crash Fix)
-        # We stop active workers gracefully without wait() to prevent UI hang
-        for w in self.active_workers[:]:
-            if isinstance(w, (FaceLoadWorker, FaceCropWorker)):
-                try: 
-                    w.stop()
-                    # We keep the reference in active_workers so it can exit safely
-                except: pass
+    def load_more_faces(self) -> None:
+        if not self.is_loading and self.has_more and not self.suggestion_btn.isChecked():
+            self._fetch_chunk()
 
-        self.face_model.clear()
-        self.last_date_key = None
-        self.current_category_id = category_id
-        self.current_date = specific_date
-        self.last_item_date = None
-        self.last_item_id = None
-        self.load_count = 0
-        self.all_loaded = False
+    def _fetch_chunk(self) -> None:
         self.is_loading = True
         self.loading_bar.setVisible(True)
         self.loading_bar.setRange(0, 0)
-        
-        # Milestone 3.4: Manage Toolbar & Suggestion State
-        is_person = (category_id >= 0)
-        self.toolbar.setVisible(is_person)
-        if self.is_suggestion_mode:
-            self.suggestion_btn.setChecked(False)
-            self.is_suggestion_mode = False
-            if self.suggestion_worker:
-                self.suggestion_worker.stop()
-                self.suggestion_worker = None
-        
-        worker = FaceLoadWorker(self.db, category_id, limit=500, 
-                                after_date=None, after_id=None, specific_date=specific_date)
-        worker.faces_loaded.connect(self.add_face_batch)
-        worker.finished.connect(self.on_load_finished)
+        worker = FaceLoadWorker(
+            self.repo,
+            self.current_category_id,
+            limit=100,
+            last_capture_date=self.last_capture_date,
+            last_face_id=self.last_face_id,
+        )
+        worker.chunk_ready.connect(self._on_faces_chunk_ready)
+        worker.result_ready.connect(self._on_faces_loaded)
+        worker.finished.connect(
+            lambda: (self.loading_bar.setVisible(False), setattr(self, "is_loading", False))
+        )
         self._track_worker(worker)
-        worker.start(QThread.LowPriority)
-
-    def on_load_finished(self):
-        self.is_loading = False
-        self.loading_bar.setVisible(False)
-        self.loading_bar.setRange(0, 100) # Reset from indeterminate mode
-        if self.load_count < self.page_size: self.all_loaded = True
-        print(f"DEBUG: Load finished. current_offset={self.current_offset}, load_count={self.load_count}")
-
-    def add_face_batch(self, cid, batch):
-        ui_start = time.perf_counter()
-        if self.current_category_id != cid: return
-        formatted = []
-        for info, qimg in batch:
-            ds = info.get("capture_date")
-            dk = ds[:10].replace(":", "/") if ds and len(ds) >= 10 else "日付不明"
-            if dk != self.last_date_key:
-                formatted.append({"is_header": True, "date_header": dk})
-                self.last_date_key = dk
-            
-            item_data = info.copy()
-            item_data.update({"qimage": qimg, "selected": False})
-            formatted.append(item_data)
-            self.load_count += 1
-        
-        self.face_model.append_data(formatted)
-        if formatted:
-            # Update Keysets from the last element that IS NOT a header
-            for i in reversed(formatted):
-                if not i.get("is_header"):
-                    self.last_item_date = i.get("capture_date")
-                    self.last_item_id = i.get("face_id")
-                    break
-
-        ui_duration = time.perf_counter() - ui_start
-        logger.info(f"UI Batch formatting/append took {ui_duration:.4f}s for {len(formatted)} elements.")
-        
-        # Milestone 2: Trigger background crop for items missing images
-        needing_crop = [f for f, img in batch if f.get("needs_crop")]
-        if needing_crop:
-            self._start_crop_worker(needing_crop)
-
-    def _start_crop_worker(self, items):
-        """Requests crops from the centralized render engine."""
-        self.render_engine.enqueue_items(items)
+        worker.start()
 
     @Slot(list)
-    def _on_images_batch_ready(self, results):
-        if not self.face_model: return
-        for face_id, qimg in results:
-            self.face_model.update_image_data(face_id, qimg)
+    def _on_faces_chunk_ready(self, faces: list[FaceInfo]) -> None:
+        with Profiler(f"FaceManagerView._on_faces_chunk_ready (count={len(faces)})"):
+            if self.is_suggestion_mode:
+                logger.info("FaceManagerView: Ignoring normal face chunk (suggestion mode active).")
+                return
 
-    def on_scroll_moved(self, value):
-        if self.is_suggestion_mode: return # Do not paginate in suggestion mode
-        if not self.is_loading and not self.all_loaded:
-            sb = self.list_view.verticalScrollBar()
-            if sb.maximum() > 0 and value >= sb.maximum() * 0.8:
-                self._trigger_load_next_chunk()
+            display_items: list[FaceDisplayItem] = []
+            cache_dir = get_face_cache_dir()
+            for f in faces:
+                cp = os.path.join(cache_dir, f"face_{f.face_id}.jpg")
+                display_items.append(
+                    FaceDisplayItem(face=f, image=cp if os.path.exists(cp) else None)
+                )
+            grouped, self.last_key = group_media_by_date_and_location(display_items, self.last_key)
+            self.face_grid.append_data(grouped)
+            crop_worker = FaceCropWorker(faces)
+            crop_worker.batch_finished.connect(self._on_crops_ready)
+            self._track_worker(crop_worker)
+            crop_worker.start()
 
-    def _trigger_load_next_chunk(self):
-        if self.is_loading or self.all_loaded: return
-        self.is_loading = True
-        self.loading_bar.setVisible(True)
-        worker = FaceLoadWorker(self.db, self.current_category_id, limit=500, 
-                                after_date=self.last_item_date, after_id=self.last_item_id,
-                                specific_date=self.current_date)
-        worker.faces_loaded.connect(self.add_face_batch)
-        worker.finished.connect(self.on_load_finished)
-        self._track_worker(worker)
-        worker.start(QThread.LowPriority)
+    @Slot(object)
+    def _on_faces_loaded(self, result: FaceLoadResult) -> None:
+        if self.is_suggestion_mode:
+            logger.info("FaceManagerView: Ignoring load_faces completion (suggestion mode active).")
+            return
 
-    def update_bulk_buttons(self):
-        count = self.face_model.get_selection_count()
-        # v2.3: Use new button names
-        for b in [self.confirm_btn, self.new_person_btn, self.other_person_btn, self.ignore_btn]:
-            b.setEnabled(count > 0)
+        if result.category_id == self.current_category_id:
+            self.has_more, self.last_capture_date, self.last_face_id = (
+                result.has_more,
+                result.last_capture_date,
+                result.last_face_id,
+            )
+            # Prefetch from 0% scroll: as soon as one chunk finishes, start the next one
+            # to keep the buffer full. We limit background prefetching to a reasonable
+            # amount (e.g., 500 items) to prevent excessive memory use for very large collections.
+            if self.has_more and len(self.face_grid.media_model._data) < 500:
+                QTimer.singleShot(200, self.load_more_faces)
 
-    def get_selected_face_ids(self):
-        return [i["face_id"] for i in self.face_model._data if not i.get("is_header") and i.get("selected")]
+    @Slot(list)
+    def _on_crops_ready(self, results: list[FaceCropResult]) -> None:
+        """Update the model with memory-cached face images using batch optimization."""
+        batch = [(res.face_id, res.image) for res in results]
+        self.face_grid.media_model.update_face_image_batch(batch)
 
-    def _select_all_current(self):
-        """Selects all currently visible face cards (Milestone 2.3)."""
-        model = self.face_model
-        for i in range(model.rowCount()):
-            item = model.get_item(i)
-            if item and not item.get("is_header"):
-                item["selected"] = True
-        model.dataChanged.emit(model.index(0,0), model.index(model.rowCount()-1,0), [Qt.UserRole])
+    def toggle_suggestion_mode(self) -> None:
+        is_on = self.suggestion_btn.isChecked()
+        self.is_suggestion_mode = is_on
+        if is_on:
+            if self.current_category_id < 0:
+                QMessageBox.warning(self, "AI提案", "特定の人物を選択してください。")
+                self.suggestion_btn.setChecked(False)
+                self.is_suggestion_mode = False
+                return
+            self.face_grid.clear()
+            self.last_key = None
+            self.loading_bar.setVisible(True)
+            self.loading_bar.setRange(0, 0)
+            self.bulk_container.setVisible(True)
+            self.btn_set_threshold.setVisible(True)
+            self.btn_select_thresh.setVisible(True)
+            self.sort_combo.setVisible(True)
+            self.btn_optimize.setVisible(False) # Optimization not applicable in suggestion mode
+            worker = FaceSuggestionWorker(self.db, self.current_category_id)
+            worker.suggestions_ready.connect(self._on_suggestions_ready)
+            worker.finished.connect(lambda: self.loading_bar.setVisible(False))
+            self._track_worker(worker)
+            worker.start()
+        else:
+            self.load_faces(self.current_category_id)
 
-    def _deselect_all_current(self):
-        model = self.face_model
-        for i in range(model.rowCount()):
-            item = model.get_item(i)
-            if item and not item.get("is_header"):
-                item["selected"] = False
-        model.dataChanged.emit(model.index(0,0), model.index(model.rowCount()-1,0), [Qt.UserRole])
-
-    def _on_confirm_selection(self):
-        """Associates selected faces with the target person."""
-        ids = self.get_selected_face_ids()
-        if not ids or not self.target_person_id: return
-        self._do_bulk_associate(ids, self.target_person_id)
-
-    def _on_new_selection(self):
-        """Registers selected faces as a completely new person."""
-        ids = self.get_selected_face_ids()
-        if not ids: return
-        worker = PersonManagementWorker(self.db, PersonAction.REGISTER_NEW, {"face_ids": ids})
-        worker.refresh_requested.connect(self.on_person_refresh_requested)
-        self._track_worker(worker)
-        worker.start()
-
-    def _on_ignore_selection(self):
-        """Marks selected faces as ignored."""
-        ids = self.get_selected_face_ids()
-        if not ids: return
-        worker = PersonManagementWorker(self.db, PersonAction.IGNORE, {"face_ids": ids})
-        worker.refresh_requested.connect(self.on_person_refresh_requested)
-        self._track_worker(worker)
-        worker.start()
-
-    def _on_other_person_selection(self):
-        """Shows a menu of existing persons to associate with."""
-        ids = self.get_selected_face_ids()
-        if not ids: return
-        
-        menu = QMenu(self)
-        persons = self.db.get_person_list_with_counts()
-        for pid, name, count in persons:
-            action = menu.addAction(f"{name or f'Person {pid}'} ({count})")
-            # Bind p=pid to avoid late binding closure issues
-            action.triggered.connect(lambda checked=False, p=pid: self._do_bulk_associate(ids, p))
-        
-        btn_pos = self.other_person_btn.mapToGlobal(QPoint(0, self.other_person_btn.height()))
-        menu.exec(btn_pos)
-
-    def _do_bulk_associate(self, ids, cid):
-        worker = PersonManagementWorker(self.db, PersonAction.ASSOCIATE_EXISTING, {"face_ids": ids, "cluster_id": cid})
-        worker.refresh_requested.connect(self.on_person_refresh_requested)
-        self._track_worker(worker)
-        worker.start()
-
-    def on_person_refresh_requested(self):
-        """Called when person metadata/clusters are changed. Refreshes BOTH sidebar and current grid."""
-        logger.info(f"on_person_refresh_requested: Refreshing current cat={self.current_category_id}")
-        self.refresh_sidebar()
-        if self.current_category_id is not None:
-            self.load_faces(self.current_category_id, self.current_date)
-        self.refresh_requested.emit()
-
-    def show_face_menu(self, fid, pos):
-        ids = self.get_selected_face_ids()
-        if fid not in ids: ids = [fid]
-        menu = QMenu(self)
-        
-        count = len(ids)
-        a1 = menu.addAction(f"✨ 新規登録 ({count}枚)")
-        a1.triggered.connect(lambda: self._bulk_register_new_with_ids(ids))
-        
-        sub = menu.addMenu(f"🔄 人物へ結合")
-        persons = self.db.get_person_list_with_counts()
-        for cid, name, count_val in persons:
-            act = sub.addAction(f"{name or cid} ({count_val})")
-            act.triggered.connect(lambda checked=False, target=cid: self._do_bulk_associate(ids, target))
+    @Slot(list)
+    def _on_suggestions_ready(self, suggestions: list[dict[str, Any]]) -> None:
+        count = len(suggestions)
+        with Profiler(f"FaceManagerView._on_suggestions_ready (count={count})"):
+            if not self.is_suggestion_mode:
+                return
             
-        a2 = menu.addAction(f"🚫 無視リストへ")
-        a2.triggered.connect(lambda: self._bulk_ignore_with_ids(ids))
+            if count == 0 and len(self.face_grid.media_model._data) == 0:
+                logger.info("FaceManagerView: No suggestions found for this person.")
+                # We show a small message box only once when the worker completes with 0 results
+                # The worker.finished signal can also be used for this.
+                return
+
+            display_items: list[FaceDisplayItem] = []
+            f_for_crop: list[FaceInfo] = []
+            cache_dir = get_face_cache_dir()
+            for s in suggestions:
+                f = FaceInfo(
+                    face_id=s["face_id"],
+                    file_path=s["file_path"],
+                    bbox=s["bbox"],
+                    frame_index=s.get("frame_index", 0),
+                    capture_date=s.get("capture_date"),
+                    similarity=s.get("similarity"),
+                    distance=s.get("distance"),
+                    metadata=s.get("metadata", {}),
+                )
+                cp = os.path.join(cache_dir, f"face_{f.face_id}.jpg")
+                display_items.append(
+                    FaceDisplayItem(face=f, image=cp if os.path.exists(cp) else None)
+                )
+                f_for_crop.append(f)
+            grouped, self.last_key = group_media_by_date_and_location(display_items, self.last_key)
+            self.face_grid.append_data(grouped)
+            if f_for_crop:
+                w = FaceCropWorker(f_for_crop)
+                w.batch_finished.connect(self._on_crops_ready)
+                self._track_worker(w)
+                w.start()
+
+    def get_selected_face_ids(self) -> list[int]:
+        return [
+            i.face.face_id
+            for i in self.face_grid.media_model._data
+            if isinstance(i, FaceDisplayItem) and i.selected
+        ]
+
+    def _execute_bulk_action(self, action_type: str, params: dict[str, Any]) -> None:
+        self.loading_bar.setVisible(True)
+        self.loading_bar.setRange(0, 0)
+        worker = PersonManagementWorker(self.db, action_type, params)
+        worker.finished_task.connect(self._on_bulk_action_finished)
+        self._track_worker(worker)
+        worker.start()
+
+    def _on_bulk_action_finished(self, success: bool, message: str) -> None:
+        self.loading_bar.setVisible(False)
+        logger.info(f"FaceManagerView: Bulk action finished (success={success}). Msg: {message}")
+        if success:
+            if self.suggestion_btn.isChecked():
+                # Directly restart suggestion worker without toggling normal mode to avoid race conditions
+                logger.info("FaceManagerView: Refreshing suggestions directly.")
+                self.face_grid.clear()
+                self.last_key = None
+                self.loading_bar.setVisible(True)
+                self.loading_bar.setRange(0, 0)
+                worker = FaceSuggestionWorker(self.db, self.current_category_id)
+                worker.suggestions_ready.connect(self._on_suggestions_ready)
+                worker.finished.connect(lambda: self.loading_bar.setVisible(False))
+                self._track_worker(worker)
+                worker.start()
+            else:
+                self.load_faces(self.current_category_id)
+            self.refresh_requested.emit()
+        else:
+            QMessageBox.critical(self, "エラー", f"失敗しました: {message}")
+
+    def select_by_threshold(self) -> None:
+        """Select all suggested faces that meet or exceed the similarity threshold."""
+        thresh = self.current_threshold
+        count = 0
+        for item in self.face_grid.media_model._data:
+            if isinstance(item, FaceDisplayItem):
+                if item.face.similarity is not None and item.face.similarity >= thresh:
+                    item.selected = True
+                    count += 1
+                else:
+                    item.selected = False
+        
+        # Trigger model update to refresh checkboxes in UI
+        self.face_grid.media_model.layoutChanged.emit()
+        logger.info(f"Threshold selection: Selected {count} faces with similarity >= {thresh}")
+
+    def _on_set_threshold_clicked(self) -> None:
+        """Open a dialog to set the similarity threshold."""
+        val, ok = QInputDialog.getDouble(
+            self, "しきい値を設定", "類似度しきい値 (0.0 - 1.0):",
+            self.current_threshold, 0.0, 1.0, 2
+        )
+        if ok:
+            self.current_threshold = val
+            self.btn_set_threshold.setText(f"しきい値を設定 ({self.current_threshold:.2f})")
+            logger.info(f"Threshold set to: {self.current_threshold}")
+
+    def _on_sort_changed(self) -> None:
+        """Sort the current grid items based on the selection."""
+        idx = self.sort_combo.currentIndex()
+        if idx < 0: return
+
+        # Isolate items from headers to avoid attribute errors
+        items = [x for x in self.face_grid.media_model._data if isinstance(x, FaceDisplayItem)]
+        if not items:
+            return
+
+        if idx in (0, 1): # Date ASC/DESC
+            reverse = (idx == 0)
+            items.sort(
+                key=lambda x: (getattr(x.face, "capture_date", "") or "", x.face.face_id),
+                reverse=reverse
+            )
+        elif idx in (2, 3): # Similarity HIGH/LOW
+            if self.current_category_id < 0:
+                return 
+                
+            # If not in suggestion mode, we need a reference centroid
+            if self.person_centroid is None:
+                self.person_centroid = self._calculate_current_centroid()
+                
+            if self.person_centroid is None:
+                return
+
+            import numpy as np
+            centroid = self.person_centroid
+            for item in items:
+                face = item.face
+                with self.db.get_connection() as conn:
+                    row = conn.execute("SELECT vector_blob FROM faces WHERE face_id = ?", (face.face_id,)).fetchone()
+                    if row and row[0]:
+                        emb = np.frombuffer(row[0], dtype=np.float32)
+                        norm = np.linalg.norm(emb)
+                        sim = float(np.dot(emb / norm, centroid)) if norm > 0 else 0.0
+                        object.__setattr__(face, "similarity", sim)
+            
+            reverse = (idx == 2)
+            items.sort(
+                key=lambda x: (getattr(x.face, "similarity", 0.0) or 0.0, x.face.face_id),
+                reverse=reverse
+            )
+
+        # Clear and re-populate with headers
+        self.face_grid.clear()
+        self.last_key = None
+        grouped, self.last_key = group_media_by_date_and_location(items, None)
+        self.face_grid.append_data(grouped)
+        logger.info(f"Re-sorted and re-grouped items by Mode {idx}")
+
+    def _calculate_current_centroid(self):
+        """Calculates centroid of the currently selected person."""
+        import numpy as np
+        with self.db.get_connection() as conn:
+            rows = conn.execute(
+                "SELECT vector_blob FROM faces WHERE cluster_id = ? AND vector_blob IS NOT NULL",
+                (self.current_category_id,),
+            ).fetchall()
+            if not rows: return None
+            embs = []
+            for r in rows:
+                emb = np.frombuffer(r[0], dtype=np.float32)
+                norm = np.linalg.norm(emb)
+                if norm > 0: embs.append(emb / norm)
+            if not embs: return None
+            mean_vec = np.mean(embs, axis=0)
+            norm_c = np.linalg.norm(mean_vec)
+            return (mean_vec / norm_c) if norm_c > 0 else mean_vec
+
+    def _on_optimize_person_clicked(self) -> None:
+        """Trigger similarity-chain analysis for the current person."""
+        if self.current_category_id < 0:
+            return
+
+        reply = QMessageBox.question(
+            self, "人物の再編・最適化",
+            "この人物に登録されている全写真を分析し、成長過程の連鎖から外れている写真（登録間違いの可能性）を探します。\n実行しますか？",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.No:
+            return
+
+        self.loading_bar.setVisible(True)
+        self.loading_bar.setRange(0, 0)
+        
+        worker = PersonOptimizationWorker(self.db, self.current_category_id)
+        worker.result_ready.connect(self._on_optimization_results)
+        worker.finished.connect(lambda: self.loading_bar.setVisible(False))
+        self._track_worker(worker)
+        worker.start()
+
+    @Slot(dict)
+    def _on_optimization_results(self, res: dict) -> None:
+        """Handle results of person optimization analysis."""
+        outlier_ids = res.get("outlier_ids", [])
+        total = res.get("total_count", 0)
+        stages = res.get("stages_count", 0)
+
+        if not outlier_ids:
+            QMessageBox.information(
+                self, "分析完了",
+                f"分析が完了しました（全 {total} 枚、{stages} つの成長ステージ）。\n現在の連鎖から外れている写真は見つかりませんでした。"
+            )
+            return
+
+        # Fetch full FaceInfo for outliers to show them visually
+        outlier_faces = self.repo.get_faces_by_ids(outlier_ids)
+        
+        # Show review dialog
+        dialog = FaceReviewDialog(
+            outlier_faces, 
+            f"最適化の提案（全 {total} 枚、{stages} ステージ）", 
+            self
+        )
+        if dialog.exec_() == QDialog.Accepted:
+            selected_ids = dialog.get_selected_ids()
+            if selected_ids:
+                # Re-use PersonManagementWorker to unregister outliers
+                mgr_worker = PersonManagementWorker(
+                    self.db, PersonAction.UNREGISTER, {"face_ids": selected_ids, "cluster_id": -1}
+                )
+                mgr_worker.finished_task.connect(
+                    lambda ok, m: (self.refresh_requested.emit()) if ok else None
+                )
+                self._track_worker(mgr_worker)
+                mgr_worker.start()
+
+    def _open_original_media(self, file_path: str) -> None:
+        """Opens the original file using system default application."""
+        if not file_path:
+            return
+        abs_p = os.path.normpath(file_path)
+        if os.path.exists(abs_p):
+            try:
+                os.startfile(abs_p)
+            except Exception as e:
+                logger.error(f"Failed to open {abs_p}: {e}")
+
+    def _show_context_menu(self, file_path: str, pos: Any) -> None:
+        """Shows registration/management context menu for selected items."""
+        ids = self.get_selected_face_ids()
+        # If nothing selected, select the right-clicked item temporarily?
+        # Actually, let's keep it strictly for selections or prompt if empty.
+        if not ids:
+            return
+
+        menu = QMenu(self)
+        
+        # 1. Register to suggested/current person
+        if self.current_category_id >= 0:
+            act_curr = menu.addAction(f"【登録】選択している人物へ")
+            act_curr.triggered.connect(self.bulk_register_current)
         
         menu.addSeparator()
-        a3 = menu.addAction(f"🖼️ キャッシュ再描画 ({count}枚)")
-        a3.triggered.connect(lambda: self._rerender_with_ids(ids))
         
-        menu.exec(pos)
-
-    def _rerender_with_ids(self, ids):
-        """Physically deletes the current cache and enqueues for immediate re-rendering."""
-        items_to_fix = []
-        for i in range(self.face_model.rowCount()):
-            item = self.face_model.get_item(i)
-            if item and not item.get("is_header") and item.get("face_id") in ids:
-                # 1. Reset Model State
-                item["qimage"] = None
-                item["needs_crop"] = True
-                item["failed"] = False
-                
-                # 2. Inform Model of Change
-                idx = self.face_model.index(i, 0)
-                self.face_model.dataChanged.emit(idx, idx, [Qt.UserRole, Qt.DecorationRole])
-                
-                # 3. Physically delete the file to be safe
-                path = os.path.join(self.cache_dir, f"face_{item['face_id']}.jpg")
-                if os.path.exists(path):
-                    try: os.remove(path)
-                    except: pass
-                
-                items_to_fix.append(item)
+        # 2. Other actions
+        act_new = menu.addAction("【新規】新しい人物として登録...")
+        act_new.triggered.connect(self.bulk_register_new)
         
-        if items_to_fix:
-            logger.info(f"Rerendering {len(items_to_fix)} faces manually.")
-            self._start_crop_worker(items_to_fix)
+        act_exist = menu.addAction("【選択】既存の人物から選ぶ...")
+        act_exist.triggered.connect(self.bulk_register_existing)
+        
+        menu.addSeparator()
+        
+        act_ignore = menu.addAction("除外（無視リストへ）")
+        act_ignore.triggered.connect(self.bulk_ignore)
+        
+        menu.exec_(pos)
 
-    def _bulk_register_new_with_ids(self, ids):
-        from PySide6.QtWidgets import QInputDialog
-        name, ok = QInputDialog.getText(self, "新規登録", f"{len(ids)}枚を新規人物として登録:")
-        if ok and name.strip():
-            worker = PersonManagementWorker(self.db, PersonAction.REGISTER_NEW, {"face_ids": ids, "name": name.strip()})
-            worker.refresh_requested.connect(self.on_person_refresh_requested)
-            self._track_worker(worker)
-            worker.start()
+    def bulk_register_current(self) -> None:
+        items = [
+            i for i in self.face_grid.media_model._data 
+            if isinstance(i, FaceDisplayItem) and i.selected
+        ]
+        if not items:
+            return
 
-    def _bulk_ignore_with_ids(self, ids):
-        if QMessageBox.question(self, "無視登録", f"{len(ids)}枚を無視しますか？") == QMessageBox.Yes:
-            worker = PersonManagementWorker(self.db, PersonAction.IGNORE_FACE, {"face_ids": ids})
-            worker.refresh_requested.connect(self.on_person_refresh_requested)
-            self._track_worker(worker)
-            worker.start()
+        # Skip faces that are already assigned to this person
+        ids = [i.face.face_id for i in items if i.face.cluster_id != self.current_category_id]
+        
+        if not ids:
+            logger.info("FaceManagerView: All selected faces are already registered to this person.")
+            QMessageBox.information(self, "登録済み", "選択された写真は既にこの人物に登録されています。")
+            return
 
-    def bulk_register_new(self):
-        self._bulk_register_new_with_ids(self.get_selected_face_ids())
-    def bulk_associate_existing(self):
+        logger.info(f"FaceManagerView: Attempting bulk registration of {len(ids)} faces to category={self.current_category_id}")
+        if (
+            ids
+            and QMessageBox.question(self, "一括登録", f"{len(ids)}件を現在の人物に登録しますか？")
+            == QMessageBox.Yes
+        ):
+            self.loading_bar.setVisible(True)
+            self.loading_bar.setRange(0, 0)
+            self._execute_bulk_action(
+                PersonAction.ASSOCIATE_EXISTING,
+                {"face_ids": ids, "cluster_id": self.current_category_id},
+            )
+
+    def bulk_register_new(self) -> None:
         ids = self.get_selected_face_ids()
-        if not ids: return
-        menu = QMenu(self)
-        for cid, name, count in self.db.get_person_list_with_counts():
-            act = menu.addAction(f"👤 {name or cid}")
-            act.triggered.connect(lambda checked=False, target=cid: self._do_bulk_associate(ids, target))
-        menu.exec(self.btn_bulk_move.mapToGlobal(QPoint(0, self.btn_bulk_move.height())))
-    def bulk_ignore(self):
-        self._bulk_ignore_with_ids(self.get_selected_face_ids())
-    
-    def show_sidebar_menu(self, pos):
-        item = self.sidebar.itemAt(pos)
-        if not item: return
-        cid = item.data(Qt.UserRole)
-        if cid is None or cid < 0: return 
+        if ids:
+            name, ok = QInputDialog.getText(
+                self, "新規人物", f"{len(ids)}件を新しい人物として作成:"
+            )
+            if ok and name.strip():
+                self._execute_bulk_action(
+                    PersonAction.REGISTER_NEW, {"face_ids": ids, "name": name.strip()}
+                )
 
-        menu = QMenu(self)
-        rename_act = menu.addAction("✏️ 名前を変更")
-        rename_act.triggered.connect(lambda: self.rename_person(item, cid))
-        
-        ignore_act = menu.addAction("🚫 この人物を無視リストへ")
-        ignore_act.triggered.connect(lambda: self.ignore_cluster(cid))
-        
-        menu.exec(self.sidebar.mapToGlobal(pos))
+    def bulk_register_existing(self) -> None:
+        ids = self.get_selected_face_ids()
+        if not ids:
+            return
+        d = QDialog(self)
+        d.setWindowTitle("人物選択")
+        v = QVBoxLayout(d)
+        lw = QListWidget()
+        for p in self.repo.get_clusters():
+            lw.addItem(p.custom_name or f"Person {p.cluster_id}")
+            lw.item(lw.count() - 1).setData(Qt.UserRole, p.cluster_id)
+        v.addWidget(lw)
+        btn = QPushButton("登録")
+        btn.clicked.connect(d.accept)
+        v.addWidget(btn)
+        if d.exec_() == QDialog.Accepted and lw.currentItem():
+            self._execute_bulk_action(
+                PersonAction.ASSOCIATE_EXISTING,
+                {"face_ids": ids, "cluster_id": lw.currentItem().data(Qt.UserRole)},
+            )
 
-    def rename_person(self, item, cid):
-        from PySide6.QtWidgets import QInputDialog
-        # Extract name from item text
-        old_full = item.text()
-        old_name = old_full.split('(')[0].strip()
-        if old_name.startswith('👤 '): old_name = old_name[2:]
-        
-        new_name, ok = QInputDialog.getText(self, "名前の変更", "新しい名前:", text=old_name)
-        if ok and new_name.strip() and new_name.strip() != old_name:
-            worker = PersonManagementWorker(self.db, PersonAction.RENAME_PERSON, {"cluster_id": cid, "name": new_name.strip()})
-            worker.refresh_requested.connect(self.on_person_refresh_requested)
-            self._track_worker(worker)
-            worker.start()
+    def bulk_ignore(self) -> None:
+        ids = self.get_selected_face_ids()
+        if (
+            ids
+            and QMessageBox.question(self, "無視", f"{len(ids)}件を除外しますか？")
+            == QMessageBox.Yes
+        ):
+            self._execute_bulk_action(PersonAction.IGNORE_FACE, {"face_ids": ids})
 
-    def ignore_cluster(self, cid):
-        if QMessageBox.warning(self, "人物を無視", "この人物（クラスタ全体）を無視リストに移動しますか？", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
-            worker = PersonManagementWorker(self.db, PersonAction.IGNORE_CLUSTER, {"cluster_id": cid})
-            worker.refresh_requested.connect(self.on_person_refresh_requested)
-            self._track_worker(worker)
-            worker.start()
+    def _track_worker(self, worker: QThread) -> None:
+        self.active_workers.append(worker)
+        worker.finished.connect(lambda: self._remove_worker(worker))
 
-    def add_face_item(self, cid, info, path):
-        self.add_face_batch(cid, [(info, path)])
+    def _remove_worker(self, worker: QThread) -> None:
+        if worker in self.active_workers:
+            self.active_workers.remove(worker)
+
+    def _cancel_active_workers(self) -> None:
+        for w in self.active_workers.copy():
+            if hasattr(w, "stop"):
+                w.stop()
+            try:
+                if hasattr(w, "chunk_ready"):
+                    w.chunk_ready.disconnect()
+            except Exception:
+                pass
+
+    @Slot(str, int, str)
+    def on_tag_clicked(self, file_path: str, cluster_id: int, name: str) -> None:
+        if cluster_id >= 0:
+            self.load_faces(cluster_id)

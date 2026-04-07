@@ -1,46 +1,44 @@
-# ER Diagram
+# ER Diagram (v3.4.1 Performance Tuned)
 
 ```mermaid
 erDiagram
-    media ||--o{ faces : "contains"
-    media ||--o{ media_features : "has"
-    clusters ||--o{ faces : "grouped in"
-    
+    media ||--o{ faces : "contains detections"
     media {
-        string file_path PK
+        string file_path PK "Normalized (NOCASE)"
         real last_modified
-        string metadata_json
-        string group_id
-        int location_id
+        text metadata_json "JSON [Res, EXIF]"
+        text group_id "FK (duplicate_groups)"
+        string capture_date "ISO-8601"
+        string file_hash "MD5 (NOCASE)"
+        int is_corrupted
         int is_in_trash
-        string capture_date
-        string file_hash
     }
 
     faces {
         int face_id PK
-        string file_path FK
-        blob vector_blob
-        string bbox_json
-        int cluster_id FK
-        int frame_index
-        int is_ignored
+        string file_path FK "idx_faces_file_path (Performance)"
+        blob vector_blob "512-dim Embedding"
+        text bbox_json "[x, y, w, h]"
+        int cluster_id "FK (clusters) | idx_faces_cluster_id"
+        int frame_index "0 for images, N for video"
+        int is_ignored "Hidden/Rejected flag"
     }
 
+    clusters ||--o{ faces : "groups"
     clusters {
         int cluster_id PK
         string custom_name
-        int is_ignored
+        int is_ignored "Cluster-wide hidden flag"
     }
 
-    ignored_person_vectors {
-        int id PK
-        blob vector_blob
-    }
-
+    media ||--o| media_features : "features"
     media_features {
         string file_path PK
-        blob vector_blob
-        blob salient_blob
+        blob vector_blob "DINOv2 Global"
+        blob salient_blob "Localized Patches"
     }
 ```
+
+## Performance Note (v3.4.1)
+- **`idx_faces_file_path`**: Critical index added to `faces` table to fix O(N^2) JOIN latency between `faces` and `media`.
+- **`idx_faces_cluster_id`**: Accelerates person-specific queries and AI suggestion candidate fetching.
