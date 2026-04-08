@@ -31,6 +31,7 @@ from processor.workers import (
     BatchFileDeleteWorker,
     BatchFileReleaseWorker,
     CleanupWorker,
+    DatabaseSyncWorker,
     DataLoaderWorker,
     DuplicateAnalysisWorker,
     DuplicateRegroupingWorker,
@@ -39,8 +40,11 @@ from processor.workers import (
     FileSyncWorker,
     LibrarySidebarResult,
     LibrarySidebarWorker,
+    LibraryThumbnailWorker,
     MediaLoadResult,
     SearchWorker,
+    TreeDataLoadResult,
+    TreeDataLoadWorker,
 )
 from ui.theme import get_style_sheet
 from ui.ui_utils import group_media_by_date_and_location
@@ -96,6 +100,19 @@ class MainWindow(QMainWindow):
 
         self.init_ui()
         self.apply_theme()
+
+        # [RESTORED] Background synchronization for capture_date denormalization
+        self.sync_worker = DatabaseSyncWorker(self.db)
+        self.sync_worker.finished_task.connect(self._on_db_sync_finished)
+        self.sync_worker.start()
+        self._track_worker(self.sync_worker)
+
+    @Slot(bool, str)
+    def _on_db_sync_finished(self, success: bool, message: str) -> None:
+        logger.info(f"MainWindow: Database synchronization finished (Success={success})")
+        # Trigger refresh to show updated counts and dates
+        self.initialize_tree()
+        self.show_images_paged()
 
     def init_ui(self) -> None:
         central_widget = QWidget()
@@ -196,6 +213,7 @@ class MainWindow(QMainWindow):
             folder = QFileDialog.getExistingDirectory(self, "Select Folder")
             if folder:
                 self.current_folder = folder
+                self.face_manager.current_folder = folder
                 self.status_label.setText(f"Scanning: {folder}...")
                 self.progress_bar.setVisible(True)
                 self.progress_bar.setRange(0, 100)
@@ -214,6 +232,11 @@ class MainWindow(QMainWindow):
                 self.initialize_tree()
                 self.show_images_paged()
                 self.face_manager.refresh_sidebar()
+
+                # Re-sync dates after file discovery complete
+                worker.finished_task.connect(
+                    lambda: self.sync_worker.start() if hasattr(self, "sync_worker") else None
+                )
 
     def on_sync_finished(self, success: bool, message: str) -> None:
         self.progress_bar.setVisible(False)
@@ -343,26 +366,22 @@ class MainWindow(QMainWindow):
         self.library_view.tree_view.initialize_categories(categories)
 
     def on_tree_load_request(self, item: Any, level: str, params: dict) -> None:
-        if level == "years":
-            years_data = self.db.media_repo.get_years(
-                params.get("cluster_id"), include_trash=self.config.include_trash
-            )
-            self.library_view.tree_view.add_sub_items(item, years_data, "years")
-        elif level == "months":
-            months_data = self.db.media_repo.get_months(
-                params.get("cluster_id"),
-                params.get("year"),
-                include_trash=self.config.include_trash,
-            )
-            self.library_view.tree_view.add_sub_items(item, months_data, "months")
-        elif level == "locations":
-            locs_data = self.db.media_repo.get_locations(
-                params.get("cluster_id"),
-                params.get("year"),
-                params.get("month"),
-                include_trash=self.config.include_trash,
-            )
-            self.library_view.tree_view.add_sub_items(item, locs_data, "locations")
+        """Asynchronously loads sub-items for a tree node to prevent UI freeze."""
+        logger.info(f"MainWindow: Loading tree sub-items (Level={level})...")
+        worker = TreeDataLoadWorker(
+            self.db, item, level, params, include_trash=self.config.include_trash
+        )
+        worker.data_ready.connect(self._on_tree_data_loaded)
+        self._track_worker(worker)
+        worker.start()
+
+    @Slot(object)
+    def _on_tree_data_loaded(self, res: TreeDataLoadResult) -> None:
+        if not res.success:
+            logger.error(f"MainWindow: Failed to load tree data for {res.level}: {res.message}")
+            return
+
+        self.library_view.tree_view.add_sub_items(res.item, res.data, res.level)
 
     def on_tree_selection(self, item: Any) -> None:
         with Profiler("MainWindow.on_tree_selection"):
@@ -474,6 +493,14 @@ class MainWindow(QMainWindow):
         )
         self.library_view.append_grid_data(grouped)
         self.current_offset += len(media_list)
+
+        # [NEW] Explosive Speed: Trigger asynchronous thumbnail loading into memory
+        loader = LibraryThumbnailWorker(media_list)
+        loader.batch_finished.connect(
+            self.library_view.grid_view.media_model.update_media_image_batch
+        )
+        self._track_worker(loader)
+        loader.start()
 
     def on_data_loaded(self, res: MediaLoadResult) -> None:
         """Finalizes a page load and updates seek markers."""

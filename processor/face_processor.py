@@ -105,7 +105,52 @@ class FaceProcessor:
                     "age": face.age,
                 }
             )
-        return results
+        # Apply intra-frame NMS (spatial deduplication)
+        return self._deduplicate_in_frame(results)
+
+    def _deduplicate_in_frame(
+        self, faces: list[dict[str, Any]], iou_threshold: float = 0.45
+    ) -> list[dict[str, Any]]:
+        """
+        Suppresses overlapping face detections within the same frame using IoU.
+        Keep the one with higher det_score.
+        """
+        if not faces:
+            return []
+
+        # Sort by confidence score descending
+        sorted_faces = sorted(faces, key=lambda x: x["det_score"], reverse=True)
+        keep = []
+
+        for i in range(len(sorted_faces)):
+            is_dup = False
+            for j in range(len(keep)):
+                iou = self.compute_iou(sorted_faces[i]["bbox"], keep[j]["bbox"])
+                if iou > iou_threshold:
+                    is_dup = True
+                    break
+            if not is_dup:
+                keep.append(sorted_faces[i])
+
+        return keep
+
+    @staticmethod
+    def compute_iou(box1: list[float], box2: list[float]) -> float:
+        """Calculates Intersection over Union (IoU) between two bounding boxes."""
+        x1, y1, x2, y2 = box1
+        x3, y3, x4, y4 = box2
+
+        inter_x1 = max(x1, x3)
+        inter_y1 = max(y1, y3)
+        inter_x2 = min(x2, x4)
+        inter_y2 = min(y2, y4)
+
+        inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
+        area1 = (x2 - x1) * (y2 - y1)
+        area2 = (x4 - x3) * (y4 - y3)
+
+        union_area = area1 + area2 - inter_area
+        return inter_area / union_area if union_area > 0 else 0
 
     def cluster_faces(
         self, face_embeddings: list[np.ndarray], eps: float = 0.42, min_samples: int = 2

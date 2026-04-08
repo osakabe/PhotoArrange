@@ -1,42 +1,42 @@
 import logging
-import os
-import sqlite3
 from typing import Any, Iterable, Optional
 
 import numpy as np
 
-from .models import ClusterInfo, FaceCountsResult, FaceInfo, MediaRecord
+from .migration_manager import DatabaseMigrationManager
+from .models import (
+    ClusterInfo,
+    DuplicateStats,
+    FaceCountsResult,
+    FaceInfo,
+    MediaRecord,
+    MonthCount,
+    YearCount,
+)
+from .repositories.base import BaseRepository
 from .repositories.face_repository import FaceRepository
 from .repositories.media_repository import MediaRepository
 from .repositories.setting_repository import SettingRepository
-from .utils import Profiler, get_app_data_dir
+from .utils import Profiler
 
 logger = logging.getLogger("PhotoArrange")
 
 
-class Database:
+class Database(BaseRepository):
     """
     Facade class for backward compatibility.
     Delegates calls to specialized repositories.
     """
 
     def __init__(self, db_path: Optional[str] = None) -> None:
-        if db_path is None:
-            self.db_path = os.path.join(get_app_data_dir(), "media_cache.db")
-        else:
-            self.db_path = db_path
+        super().__init__(db_path)
 
         self.media_repo = MediaRepository(self.db_path)
         self.face_repo = FaceRepository(self.db_path)
         self.settings_repo = SettingRepository(self.db_path)
+        self.migration_manager = DatabaseMigrationManager(self.db_path)
 
         self.init_db()
-
-    def get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        return conn
 
     def init_db(self) -> None:
         """Ensures schema is initialized with performance tracking."""
@@ -59,69 +59,57 @@ class Database:
                         month INTEGER
                     )
                 """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS faces (
-                    face_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    file_path TEXT NOT NULL COLLATE NOCASE,
-                    vector_blob BLOB NOT NULL,
-                    bbox_json TEXT,
-                    cluster_id INTEGER,
-                    is_ignored INTEGER DEFAULT 0,
-                    frame_index INTEGER DEFAULT 0
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS clusters (
-                    cluster_id INTEGER PRIMARY KEY,
-                    custom_name TEXT,
-                    is_ignored INTEGER DEFAULT 0
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS locations (
-                    location_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    country TEXT,
-                    prefecture TEXT,
-                    city TEXT,
-                    UNIQUE(country, prefecture, city)
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS duplicate_groups (
-                    group_id TEXT PRIMARY KEY,
-                    discovery_method TEXT
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS media_features (
-                    file_path TEXT PRIMARY KEY COLLATE NOCASE,
-                    vector_blob BLOB,
-                    salient_blob BLOB
-                )
-            """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS faces (
+                        face_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        file_path TEXT NOT NULL COLLATE NOCASE,
+                        vector_blob BLOB NOT NULL,
+                        bbox_json TEXT,
+                        cluster_id INTEGER DEFAULT -1,
+                        is_ignored INTEGER DEFAULT 0,
+                        frame_index INTEGER DEFAULT 0,
+                        capture_date TEXT
+                    )
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS clusters (
+                        cluster_id INTEGER PRIMARY KEY,
+                        custom_name TEXT,
+                        is_ignored INTEGER DEFAULT 0
+                    )
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS settings (
+                        key TEXT PRIMARY KEY,
+                        value TEXT
+                    )
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS locations (
+                        location_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        country TEXT,
+                        prefecture TEXT,
+                        city TEXT,
+                        UNIQUE(country, prefecture, city)
+                    )
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS duplicate_groups (
+                        group_id TEXT PRIMARY KEY COLLATE NOCASE,
+                        discovery_method TEXT
+                    )
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS media_features (
+                        file_path TEXT PRIMARY KEY COLLATE NOCASE,
+                        vector_blob BLOB,
+                        salient_blob BLOB
+                    )
+                """)
 
-            # Speed optimizations: Add indexes for frequently queried columns
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_media_is_in_trash ON media(is_in_trash)")
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_media_group_id ON media(group_id) WHERE group_id IS NOT NULL"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_media_date_composite ON media(year, month, capture_date)"
-            )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_media_capture_date ON media(capture_date)")
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_media_trash_corrupt ON media(is_in_trash, is_corrupted)"
-            )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_faces_cluster ON faces(cluster_id)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_faces_path ON faces(file_path)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_faces_ignored ON faces(is_ignored)")
-            conn.commit()
+                # --- [DECOUPLED] Delegate schema updates and performance optimizations ---
+                self.migration_manager.run_migrations()
+                conn.commit()
 
     # --- Delegated Media Methods ---
     def get_media(self, file_path: str) -> Optional[MediaRecord]:
@@ -142,16 +130,16 @@ class Database:
     def get_media_paths_in_folder(self, folder_path: str) -> list[str]:
         return self.media_repo.get_media_paths_in_folder(folder_path)
 
-    def get_years(self, *args: Any, **kwargs: Any) -> list[int]:
+    def get_years(self, *args: Any, **kwargs: Any) -> list[YearCount]:
         return self.media_repo.get_years(*args, **kwargs)
 
-    def get_months(self, *args: Any, **kwargs: Any) -> list[int]:
+    def get_months(self, *args: Any, **kwargs: Any) -> list[MonthCount]:
         return self.media_repo.get_months(*args, **kwargs)
 
-    def get_locations(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+    def get_locations(self, *args: Any, **kwargs: Any) -> list[tuple[str, int]]:
         return self.media_repo.get_locations(*args, **kwargs)
 
-    def get_duplicate_stats(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+    def get_duplicate_stats(self, *args: Any, **kwargs: Any) -> DuplicateStats:
         return self.media_repo.get_duplicate_stats(*args, **kwargs)
 
     def merge_duplicate_paths_batch(self, pairs: list[tuple[str, list[str]]]) -> None:
@@ -252,3 +240,9 @@ class Database:
 
     def save_setting(self, key: str, value: Any) -> None:
         self.settings_repo.save_setting(key, value)
+
+    def sync_capture_dates(self) -> None:
+        """Denormalizes capture_date into the faces table for sub-100ms sorting.
+        This is now delegated to the MigrationManager.
+        """
+        self.migration_manager.sync_capture_dates()

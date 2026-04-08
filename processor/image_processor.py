@@ -1,11 +1,14 @@
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
 from datetime import datetime
+from typing import Any, Optional
 
 import cv2
+import numpy as np
 from PIL import Image
 
 from core.utils import Profiler
@@ -20,21 +23,23 @@ except ImportError:
 
 from core.utils import fix_dll_search_path, get_app_data_dir, get_short_path_name
 
+logger = logging.getLogger("PhotoArrange")
+
 fix_dll_search_path()  # Required for cv2 videoio FFmpeg DLLs on Windows
 
 
 class ImageProcessor:
-    def __init__(self, thumbnail_size=(256, 256)):
+    def __init__(self, thumbnail_size: tuple[int, int] = (256, 256)) -> None:
         self.thumbnail_size = thumbnail_size
         self.thumbnails_dir = os.path.join(get_app_data_dir(), ".thumbnails")
         if not os.path.exists(self.thumbnails_dir):
             os.makedirs(self.thumbnails_dir, exist_ok=True)
 
-        self.device = None
+        self.device: Optional[torch.device] = None
         if HAS_TORCH and torch.cuda.is_available():
             self.device = torch.device("cuda")
 
-    def get_file_hash(self, file_path):
+    def get_file_hash(self, file_path: str) -> Optional[str]:
         """
         Calculates a full-file MD5 checksum for exact bit-for-bit duplicate detection.
         """
@@ -46,14 +51,10 @@ class ImageProcessor:
                         hash_md5.update(chunk)
                 return hash_md5.hexdigest()
             except Exception as e:
-                import logging
-
-                logging.getLogger("PhotoArrange").error(
-                    f"Error calculating MD5 for {file_path}: {e}"
-                )
+                logger.error(f"Error calculating MD5 for {file_path}: {e}")
                 return None
 
-    def get_metadata(self, image_path):
+    def get_metadata(self, image_path: str) -> dict[str, Any]:
         with Profiler(f"ImageProcessor.get_metadata ({os.path.basename(image_path)})"):
             try:
                 with Image.open(image_path) as img:
@@ -63,7 +64,7 @@ class ImageProcessor:
                     date_obj = None
                     if date_str:
                         try:
-                            date_obj = datetime.strptime(date_str, "%Y:%m:%d %H:%M:%S")
+                            date_obj = datetime.strptime(str(date_str), "%Y:%m:%d %H:%M:%S")
                         except:
                             pass
 
@@ -71,7 +72,7 @@ class ImageProcessor:
                         mtime = os.path.getmtime(image_path)
                         date_obj = datetime.fromtimestamp(mtime)
 
-                    meta = {
+                    meta: dict[str, Any] = {
                         "date_taken": date_obj.strftime("%Y:%m:%d %H:%M:%S"),
                         "has_exif_date": True if date_str else False,
                         "year": date_obj.year,
@@ -90,22 +91,18 @@ class ImageProcessor:
                         meta["has_location"] = False
                 return meta
             except Exception as e:
-                import logging
-
-                logging.getLogger("PhotoArrange").error(
-                    f"Error reading metadata for {image_path}: {e}"
-                )
+                logger.error(f"Error reading metadata for {image_path}: {e}")
                 # Mark as corrupted if even basic Pillow opening fails
                 corrupted_meta = {
                     "corrupted": True,
-                    "size": os.path.exists(image_path) and os.path.getsize(image_path) or 0,
+                    "size": os.path.getsize(image_path) if os.path.exists(image_path) else 0,
                 }
                 return corrupted_meta
 
-    def get_video_metadata(self, video_path):
+    def get_video_metadata(self, video_path: str) -> dict[str, Any]:
         mtime = os.path.getmtime(video_path)
         date_obj = datetime.fromtimestamp(mtime)
-        meta = {
+        meta: dict[str, Any] = {
             "date_taken": date_obj.strftime("%Y:%m:%d %H:%M:%S"),
             "year": date_obj.year,
             "month": date_obj.month,
@@ -125,17 +122,12 @@ class ImageProcessor:
             pass
 
         try:
-            # Silence stderr to avoid cluttered logs and parsing errors
             cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", video_path]
             try:
                 res = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=15)
                 data = json.loads(res).get("format", {})
             except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
-                import logging
-
-                logging.getLogger("PhotoArrange").warning(
-                    f"ffprobe failed or timed out for {video_path}: {e}"
-                )
+                logger.warning(f"ffprobe failed or timed out for {video_path}: {e}")
                 data = {}
 
             tags = data.get("tags", {})
@@ -147,7 +139,7 @@ class ImageProcessor:
             ctime = tags.get("creation_time")
             if ctime:
                 try:
-                    dt = datetime.fromisoformat(ctime.replace("Z", "+00:00"))
+                    dt = datetime.fromisoformat(str(ctime).replace("Z", "+00:00"))
                     meta["date_taken"] = dt.strftime("%Y:%m:%d %H:%M:%S")
                     meta["has_exif_date"] = True
                     meta["year"] = dt.year
@@ -162,7 +154,7 @@ class ImageProcessor:
 
             loc = tags.get("com.apple.quicktime.location.ISO6709") or tags.get("location")
             if loc:
-                match = re.match(r"([+-][0-9.]+)([+-][0-9.]+)([+-][0-9.]+)?/?", loc)
+                match = re.match(r"([+-][0-9.]+)([+-][0-9.]+)([+-][0-9.]+)?/?", str(loc))
                 if match:
                     meta["lat"] = float(match.group(1))
                     meta["lon"] = float(match.group(2))
@@ -177,7 +169,7 @@ class ImageProcessor:
             pass
         return meta
 
-    def _get_gps_from_exif(self, exif):
+    def _get_gps_from_exif(self, exif: Any) -> Optional[tuple[float, float, float]]:
         if not exif:
             return None
         try:
@@ -188,14 +180,14 @@ class ImageProcessor:
 
             from PIL.ExifTags import GPSTAGS
 
-            gps_info = {}
+            gps_info: dict[str, Any] = {}
             for t, v in gps_ifd.items():
-                tag = GPSTAGS.get(t, t)
+                tag = str(GPSTAGS.get(t, t))
                 gps_info[tag] = v
 
             if "GPSLatitude" in gps_info and "GPSLongitude" in gps_info:
 
-                def to_decimal(dms, ref):
+                def to_decimal(dms: Any, ref: str) -> float:
                     try:
                         # Some DMS are (degrees, minutes, seconds)
                         d = float(dms[0])
@@ -208,19 +200,21 @@ class ImageProcessor:
                     except:
                         return 0.0
 
-                lat = to_decimal(gps_info["GPSLatitude"], gps_info.get("GPSLatitudeRef", "N"))
-                lon = to_decimal(gps_info["GPSLongitude"], gps_info.get("GPSLongitudeRef", "E"))
+                lat = to_decimal(gps_info["GPSLatitude"], str(gps_info.get("GPSLatitudeRef", "N")))
+                lon = to_decimal(
+                    gps_info["GPSLongitude"], str(gps_info.get("GPSLongitudeRef", "E"))
+                )
                 alt = float(gps_info.get("GPSAltitude", 0))
                 return lat, lon, alt
         except:
             pass
         return None
 
-    def get_thumbnail_path(self, file_path):
+    def get_thumbnail_path(self, file_path: str) -> str:
         path_hash = hashlib.sha256(file_path.encode("utf-8")).hexdigest()[:16]
         return os.path.join(self.thumbnails_dir, f"{path_hash}_{os.path.basename(file_path)}.jpg")
 
-    def generate_thumbnail(self, file_path):
+    def generate_thumbnail(self, file_path: str) -> Optional[str]:
         # Use a hash of the full path to avoid collisions for files with same name in different folders
         target_path = self.get_thumbnail_path(file_path)
         if os.path.exists(target_path):
@@ -257,29 +251,23 @@ class ImageProcessor:
                         img.save(target_path, "JPEG")
                 return target_path
             except Exception as e:
-                import logging
-
-                logging.getLogger("PhotoArrange").error(
-                    f"Error generating thumbnail for {file_path}: {e}"
-                )
+                logger.error(f"Error generating thumbnail for {file_path}: {e}")
                 return None
 
-    def extract_video_frames(self, video_path, num_frames=5):
+    def extract_video_frames(
+        self, video_path: str, num_frames: int = 5
+    ) -> list[tuple[np.ndarray, int]]:
         """
         Extracts representative frames from a video for AI embedding or face detection.
         Defaults to 5 frames for robust duplicate detection (v2.0).
         """
-        frames_with_indices = []
+        frames_with_indices: list[tuple[np.ndarray, int]] = []
         try:
             # Use short path name for VideoCapture on Windows
             short_path = get_short_path_name(video_path)
             cap = cv2.VideoCapture(short_path)
             if not cap.isOpened():
-                import logging
-
-                logging.getLogger("PhotoArrange").error(
-                    f"Could not open video with VideoCapture: {video_path}"
-                )
+                logger.error(f"Could not open video with VideoCapture: {video_path}")
                 return []
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             if total_frames <= 0:
@@ -295,25 +283,16 @@ class ImageProcessor:
                     success, frame = cap.read()
                     if success:
                         # Return both the frame and its index
-                        # For AI embedding, we might prefer RGB, but we return raw BGR for consistency with OpenCV
                         frames_with_indices.append((frame, pos))
                 except Exception as inner_e:
-                    import logging
-
-                    logging.getLogger("PhotoArrange").error(
-                        f"Error reading frame at {pos} in {video_path}: {inner_e}"
-                    )
+                    logger.error(f"Error reading frame at {pos} in {video_path}: {inner_e}")
                     continue
             cap.release()
         except Exception as e:
-            import logging
-
-            logging.getLogger("PhotoArrange").error(
-                f"Error extracting frames from {video_path}: {e}"
-            )
+            logger.error(f"Error extracting frames from {video_path}: {e}")
         return frames_with_indices
 
-    def clear_thumbnails(self):
+    def clear_thumbnails(self) -> None:
         if os.path.exists(self.thumbnails_dir):
             for f in os.listdir(self.thumbnails_dir):
                 file_path = os.path.join(self.thumbnails_dir, f)

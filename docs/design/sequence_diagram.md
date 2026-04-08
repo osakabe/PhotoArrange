@@ -1,58 +1,77 @@
-# Sequence Diagram - Face Loading & AI Suggestion Flows
+# Sequence Diagrams (v4.5 Explosive Speed)
 
-## 1. SQL Category Loading (Standard)
+## 1. Application Startup & Initialization
+This sequence demonstrates how heavy database synchronization is offloaded to ensure an instant UI appearance.
+
 ```mermaid
 sequenceDiagram
-    participant UI as FaceManagerView
-    participant Worker as FaceLoadWorker
+    participant U as User
+    participant M as MainWindow
     participant DB as Database
-    participant Model as FaceModel
+    participant MM as MigrationManager
+    participant W as DatabaseSyncWorker
 
-    UI->>Worker: start(category_id, offset)
-    activate Worker
-    Worker->>DB: get_faces_by_category(...)
-    activate DB
-    DB-->>Worker: list records
-    deactivate DB
+    U->>M: Launch App
+    M->>DB: Instantiate
+    DB->>MM: Instantiate
+    DB->>MM: run_migrations()
+    MM-->>DB: Indices & Schema Ready
+    M->>M: init_ui()
+    M-->>U: Show Window (Instant)
     
-    loop Batch (100 items)
-        Worker->>UI: faces_loaded(cid, batch)
-        UI->>Model: append_data(batch)
-        UI->>Render: enqueue_items(batch)
-    end
-    deactivate Worker
+    Note over M, W: Background Maintenance
+    M->>W: Start(db)
+    W->>DB: sync_capture_dates()
+    DB->>MM: sync_capture_dates()
+    MM->>MM: SQL: UPDATE faces SET capture_date...
+    MM-->>W: Sync Complete
+    W-->>M: Signal(finished)
 ```
 
-## 2. AI Suggestion Workflow (Vectorized Infinite Scroll)
+## 2. Explosive Face Loading (Single Table Lookup)
+Demonstrates sub-100ms loading by bypassing expensive JOINs and leveraging the explosive sort index.
+
 ```mermaid
 sequenceDiagram
-    participant UI as FaceManagerView
-    participant AI as FaceSuggestionWorker
-    participant DB as Database
-    participant Pool as Suggestion Pool (Memory)
-    participant Model as FaceModel
-    participant Render as FaceCropManager
+    participant V as FaceManagerView
+    participant W as FaceLoadWorker
+    participant R as FaceRepository
+    participant DB as SQLite (idx_faces_explosive_sort)
+    participant Model as MediaModel
 
-    UI->>AI: start(target_person_id)
-    activate AI
-    AI->>DB: get_person_centroid()
-    AI->>DB: fetch 10,000 Vectors (WHERE Unknown)
-    DB-->>AI: vector blobs
+    V->>W: start(category_id)
+    W->>R: get_faces_by_category()
+    R->>DB: SELECT * FROM faces WHERE ... ORDER BY capture_date DESC
+    Note right of DB: Single-table index lookup (<100ms)
+    DB-->>R: list[FaceInfo]
+    R-->>W: list[FaceInfo]
+    W-->>V: Signal(faces_ready)
+    V->>Model: append_data(display_items)
+    Model-->>V: dataChanged()
+```
+
+## 3. Orchestrated AI Suggestions
+Demonstrates the flattened processing flow in the UI layer.
+
+```mermaid
+sequenceDiagram
+    participant V as FaceManagerView
+    participant W as FaceSuggestionWorker
+    participant Logic as SuggestionLogic
+    participant Model as MediaModel
+    participant Crop as FaceCropWorker
+
+    V->>W: start(person_id)
+    W->>Logic: calculate_similarities()
+    Logic-->>W: list[matches]
+    W->>V: suggestions_ready(list)
     
-    AI->>AI: np.linalg.norm (Vectorized L2 Dist)
-    AI->>UI: suggestions_ready(list)
-    deactivate AI
-
-    UI->>Pool: Store all (e.g. 5000 items)
-    UI->>UI: _load_next_suggestion_batch(0-100)
-    UI->>Model: append_data(100)
-    UI->>Render: enqueue_items(100)
+    V->>V: _should_ignore_suggestions()
+    V->>V: _build_display_items()
+    V->>V: _apply_suggestion_grouping()
+    V->>Model: append_data()
+    V->>Crop: start(faces)
     
-    Note over UI, Render: Async Thumbnail Generation
-    Render-->>Model: images_ready(batch)
-    Model-->>UI: dataChanged()
-
-    UI->>UI: on_scroll_moved (threshold > 80%)
-    UI->>UI: _load_next_suggestion_batch(100-200)
-    UI->>Model: append_data(100)
+    Crop-->>Model: update_face_image_batch()
+    Model-->>V: dataChanged()
 ```

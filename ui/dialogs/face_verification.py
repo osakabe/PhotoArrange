@@ -68,7 +68,7 @@ class FaceLoadWorker(QThread):
                         nw, nh = nw * 1.2, nh * 1.2
                         crop_rect = QRect(int(nx1), int(ny1), int(nw), int(nh))
                         pix = pix.copy(crop_rect)
-                    except:
+                    except Exception:
                         pass
 
         self.loaded.emit(frame_idx, pix if pix else QPixmap(), name)

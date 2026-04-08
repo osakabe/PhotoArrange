@@ -4,6 +4,7 @@ import os
 import shutil
 import time
 from ctypes import wintypes
+from typing import Any
 
 logger = logging.getLogger("PhotoArrange")
 
@@ -22,7 +23,7 @@ class Profiler:
         self.start = time.perf_counter()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         elapsed = time.perf_counter() - self.start
         import threading
 
@@ -168,3 +169,13 @@ def move_file_to_local_trash(file_path: str, root_folder: str) -> str:
     except Exception as e:
         logger.error(f"Error moving file to local trash: {e}")
         return file_path
+
+
+def normalize_path(path: str) -> str:
+    """
+    Normalizes a file path for Windows environments to avoid case-sensitivity
+    and relative path issues in the database.
+    """
+    if not path:
+        return path
+    return os.path.normcase(os.path.abspath(path))

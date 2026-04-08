@@ -1,11 +1,19 @@
-# PhotoArrange Design Documents
+# PhotoArrange Design Documentation (v4.5 Explosive Speed)
 
-このディレクトリには、PhotoArrangeの設計に関するドキュメントと図表が格納されています。
+This directory contains the formal architectural specifications and diagrams for the PhotoArrange project.
 
-## コンテンツ
+## 🚀 Architectural Vision: Explosive Speed
+The current architecture (v4.5) is focused on overcoming the "N+1 Problem" and "JOIN latency" inherent in large media databases. We achieve **sub-100ms loading** for up to 100,000 records through:
+1.  **Denormalized-Local Search**: Mirroring critical metadata into secondary tables.
+2.  **Explosive Sorting Indices**: Using composite B-Tree indexes for single-table filtered sorting.
+3.  **Decoupled Initialization**: Using `DatabaseMigrationManager` to handle heavy lifecycle tasks asynchronously.
 
-1.  [ER図 (Entity Relationship Diagram)](er_diagram.md) - データベーススキーマの構造
-2.  [クラス図 (Class Diagram)](class_diagram.md) - 主要なクラスとその関係
-3.  [シーケンス図 (Sequence Diagram)](sequence_diagram.md) - 写真読み込みフロー
-4.  [ステートマシン図 (State Machine Diagram)](state_machine.md) - メディア処理のライフサイクル
-5.  [技術仕様書 (Technical Specification)](specification.md) - システム全体の詳細仕様
+## 📂 Document Map
+- [**Specification.md**](specification.md): Technical requirements and engineering standards (Complexity <= 10).
+- [**ER_Diagram.md**](er_diagram.md): Denormalized schema and explosive index definitions.
+- [**Class_Diagram.md**](class_diagram.md): Component structure and selection-predicate strategies.
+- [**Sequence_Diagram.md**](sequence_diagram.md): Decoupled startup and JOIN-free loading flows.
+- [**State_Machine.md**](state_machine.md): AI Suggestion lifecycle and interaction states.
+
+---
+*Maintained by the QA Sheriff. Last Major Update: v4.5 Reform.*

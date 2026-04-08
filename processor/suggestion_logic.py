@@ -3,8 +3,8 @@ import logging
 import time
 
 import numpy as np
-from sklearn.cluster import DBSCAN
 from PySide6.QtCore import Signal
+from sklearn.cluster import DBSCAN
 
 from core.base_worker import BaseWorker
 from core.utils import Profiler
@@ -46,8 +46,10 @@ class FaceSuggestionWorker(BaseWorker):
                     sug_radius = float(raw_thresh) / 100.0
                 except (ValueError, TypeError):
                     sug_radius = 0.55
-                
-                logger.info(f"FaceSuggestionWorker: Using radius threshold {sug_radius:.2f} (from setting {raw_thresh})")
+
+                logger.info(
+                    f"FaceSuggestionWorker: Using radius threshold {sug_radius:.2f} (from setting {raw_thresh})"
+                )
 
                 # Collect all stage centroids for comparison
                 stage_centroids = [s[0] for s in stages]
@@ -97,16 +99,16 @@ class FaceSuggestionWorker(BaseWorker):
                     all_stage_dists = []
                     for c_emb in stage_centroids:
                         all_stage_dists.append(np.linalg.norm(matrix - c_emb, axis=1))
-                    
+
                     # Target distance is the minimum distance to ANY stage
                     dists = np.min(all_stage_dists, axis=0)
-                    
+
                     # A face matches if it is winthin the radius of its closest stage
                     # For simplicity, we can use a global threshold or individual radii.
                     # Here we use individual radii for the matched stage.
                     closest_stage_idx = np.argmin(all_stage_dists, axis=0)
                     matched_radii = np.array([radii[idx] for idx in closest_stage_idx])
-                    
+
                     matches_mask = dists <= matched_radii
                     match_indices = np.where(matches_mask)[0]
 
@@ -150,11 +152,13 @@ class FaceSuggestionWorker(BaseWorker):
                             emb = np.frombuffer(h_row[7], dtype=np.float32)
                             norm = np.linalg.norm(emb)
                             norm_emb = emb / norm if norm > 0 else emb
-                            
+
                             # Find best matching stage for this face
                             stage_sims = [float(np.dot(norm_emb, c)) for c in stage_centroids]
                             best_sim = max(stage_sims)
-                            best_dist = float(np.linalg.norm(norm_emb - stage_centroids[np.argmax(stage_sims)]))
+                            best_dist = float(
+                                np.linalg.norm(norm_emb - stage_centroids[np.argmax(stage_sims)])
+                            )
 
                             chunk_results.append(
                                 {
@@ -232,26 +236,26 @@ class FaceSuggestionWorker(BaseWorker):
                 data = np.array(embs)
                 clustering = DBSCAN(eps=0.38, min_samples=2, metric="cosine").fit(data)
                 labels = clustering.labels_
-                
+
                 stages = []
                 # Process each identified cluster
                 unique_labels = set(labels)
                 for label in unique_labels:
-                    if label == -1: # Outliers
+                    if label == -1:  # Outliers
                         continue
-                    
+
                     indices = np.where(labels == label)[0]
                     cluster_embs = data[indices]
-                    
+
                     # Sub-centroid
                     mean_vec = np.mean(cluster_embs, axis=0)
                     norm_c = np.linalg.norm(mean_vec)
                     centroid = (mean_vec / norm_c) if norm_c > 0 else mean_vec
-                    
+
                     # Radius for this stage
                     max_d = max([np.linalg.norm(centroid - e) for e in cluster_embs])
                     stages.append((centroid, max_d))
-                
+
                 # Check for outliers: if no clusters found or if people have very few photos in stages
                 if not stages:
                     # Fallback to single mean
@@ -260,6 +264,8 @@ class FaceSuggestionWorker(BaseWorker):
                     centroid = (mean_vec / norm_c) if norm_c > 0 else mean_vec
                     max_d = max([np.linalg.norm(centroid - e) for e in embs])
                     return [(centroid, max_d)]
-                
-                logger.info(f"Appearance Stages Extracted for Person {self.target_person_id}: {len(stages)} stages.")
+
+                logger.info(
+                    f"Appearance Stages Extracted for Person {self.target_person_id}: {len(stages)} stages."
+                )
                 return stages

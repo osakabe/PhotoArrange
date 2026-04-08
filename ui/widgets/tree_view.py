@@ -222,45 +222,69 @@ class MediaTreeView(QTreeView):
         if key in self.expanded_keys:
             self.expanded_keys.remove(key)
 
-    def add_sub_items(
-        self, parent_item: QStandardItem, items: list[tuple[Any, int]], level: str
-    ) -> None:
-        """
-        Adds sub-items (years, months, locations) with counts.
-        """
+    def _get_item_val(self, obj: Any) -> Any:
+        """Extracts the value (year/month/city) from dataclasses or tuples."""
+        if hasattr(obj, "year"):
+            return obj.year
+        if hasattr(obj, "month"):
+            return obj.month
+        if hasattr(obj, "city"):
+            return obj.city
+        return obj[0]
+
+    def _get_item_count(self, obj: Any) -> Optional[int]:
+        """Extracts the count from dataclasses or tuples."""
+        if hasattr(obj, "count"):
+            return obj.count
+        return obj[1] if isinstance(obj, (list, tuple)) and len(obj) > 1 else None
+
+    def add_sub_items(self, parent_item: QStandardItem, items: list[Any], level: str) -> None:
+        """Adds sub-items (years, months, locations) with counts. Asynchronous result handler."""
         with Profiler(f"MediaTreeView.add_sub_items (level={level}, count={len(items)})"):
             try:
-                for val, count in sorted(
-                    items, key=lambda x: str(x[0]), reverse=(level == "years")
-                ):
-                    display_text = f"{val} ({count:,})" if count is not None else str(val)
-                    sub_item = QStandardItem(display_text)
-                    sub_item.setData(level, Qt.UserRole + 2)
-                    sub_item.setData(False, Qt.UserRole + 3)
-                    sub_item.setData(val, Qt.UserRole + 11)
+                # 1. Sort items based on level
+                sorted_items = sorted(
+                    items, key=lambda x: str(self._get_item_val(x)), reverse=(level == "years")
+                )
 
-                    if level == "years":
-                        sub_item.setData(val, Qt.UserRole + 4)
-                        sub_item.appendRow(QStandardItem("Loading..."))
-                    elif level == "months":
-                        p = parent_item.parent()
-                        cid = p.data(Qt.UserRole) if p else parent_item.data(Qt.UserRole)
-                        year = parent_item.data(Qt.UserRole + 4)
-                        sub_item.setData((cid, year, val), Qt.UserRole + 1)
-                        sub_item.appendRow(QStandardItem("Loading..."))
-                    elif level == "locations":
-                        data = parent_item.data(Qt.UserRole + 1)
-                        if data and len(data) >= 3:
-                            cid, year, month = data[:3]
-                            sub_item.setData((cid, year, month, val), Qt.UserRole + 1)
+                for item_obj in sorted_items:
+                    val = self._get_item_val(item_obj)
+                    count = self._get_item_count(item_obj)
+                    self._create_sub_item(parent_item, val, count, level)
 
-                    parent_item.appendRow(sub_item)
-                    key = self.get_item_key(sub_item)
-                    if key and key in self.expanded_keys:
-                        self.expand(sub_item.index())
+                parent_item.setData(True, Qt.UserRole + 3)  # Mark as loaded
                 self.restore_scroll()
             except Exception as e:
                 logger.error(f"Tree[{id(self)}]: add_sub_items error: {e}")
+
+    def _create_sub_item(
+        self, parent: QStandardItem, val: Any, count: Optional[int], level: str
+    ) -> None:
+        display_text = f"{val} ({count:,})" if count is not None else str(val)
+        sub_item = QStandardItem(display_text)
+        sub_item.setData(level, Qt.UserRole + 2)
+        sub_item.setData(False, Qt.UserRole + 3)  # Is loaded
+        sub_item.setData(val, Qt.UserRole + 11)  # raw_value
+
+        if level == "years":
+            sub_item.setData(val, Qt.UserRole + 4)  # year_val
+            sub_item.appendRow(QStandardItem("Loading..."))
+        elif level == "months":
+            p = parent.parent()
+            cid = p.data(Qt.UserRole) if p else parent.data(Qt.UserRole)
+            year = parent.data(Qt.UserRole + 4)
+            sub_item.setData((cid, year, val), Qt.UserRole + 1)
+            sub_item.appendRow(QStandardItem("Loading..."))
+        elif level == "locations":
+            data = parent.data(Qt.UserRole + 1)
+            if data and len(data) >= 3:
+                cid, year, month = data[:3]
+                sub_item.setData((cid, year, month, val), Qt.UserRole + 1)
+
+        parent.appendRow(sub_item)
+        key = self.get_item_key(sub_item)
+        if key and key in self.expanded_keys:
+            self.expand(sub_item.index())
 
     def restore_scroll(self):
         """Attempts to restore the scroll position after a short delay to account for UI layout."""
